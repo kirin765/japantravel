@@ -1,0 +1,4 @@
+"""Shared constants."""
+
+DEFAULT_TIMEOUT_SECONDS = 20
+DEFAULT_TOP_K = 10
