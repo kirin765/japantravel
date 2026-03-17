@@ -10,4 +10,11 @@ This repository contains a structural scaffold for a content generation pipeline
 - review module
 - scheduler module
 
-The code intentionally focuses on architecture and module boundaries only.
+Repository: https://github.com/kirin765/japantravel
+Default branch: `main`
+
+The code intentionally focuses on architecture and module boundaries.
+
+## Security
+- Actual secrets are not committed.
+- Fill runtime values in `.env` from `.env.example`.
