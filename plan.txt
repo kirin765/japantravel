@@ -1,0 +1,557 @@
+
+
+여행지 장소 추천 블로그 자동화 시스템 설계 문서
+
+1. 목표
+
+한국어 사용자 대상의 여행 정보 블로그를 구축한다.
+주요 콘텐츠는 다음과 같다.
+	•	여행지 음식점 추천
+	•	관광지 추천
+	•	가게/카페 추천
+	•	상황별 추천
+	•	혼자 여행
+	•	부모님 동반
+	•	비 오는 날
+	•	야간 도착
+	•	공항/역 근처
+	•	짧은 동선
+
+이 시스템은 단순한 “맛집 리스트”가 아니라, 한국인 여행자의 특정 상황을 해결하는 추천 글을 자동 또는 반자동으로 생성해 WordPress에 발행하는 것을 목표로 한다.
+
+⸻
+
+2. 핵심 전략
+
+2.1 기본 원칙
+
+이 시스템의 핵심은 API가 아니라 추천 로직이다.
+
+단순히 장소 데이터를 모아 “평점 높은 순”으로 글을 만들면 차별화가 거의 없다.
+반드시 아래 방향으로 구현해야 한다.
+	•	일반 추천이 아니라 조건부 추천
+	•	단순 데이터 나열이 아니라 상황 해석
+	•	장소 수집과 추천 판단을 분리
+	•	글 생성과 사실 검수를 분리
+
+2.2 추천 방향
+
+좋은 예:
+	•	후쿠오카 혼자 여행 저녁 식당 추천
+	•	도쿄 비 오는 날 실내 관광지 추천
+	•	하네다 공항 도착 후 3시간 안에 갈 수 있는 곳
+	•	하카타역 근처 캐리어 끌고 가기 쉬운 식당
+
+나쁜 예:
+	•	도쿄 맛집 추천
+	•	오사카 관광지 추천
+	•	제주 카페 추천
+
+⸻
+
+3. 데이터 소스 선택 방침
+
+3.1 Google Places API
+
+Google Places API는 Google Maps Platform의 공식 장소 데이터 API다. HTTP 요청으로 장소 정보와 이미지 등을 반환하며, Place Details로 주소, 전화번호, 평점, 리뷰 등을 조회할 수 있다. 또한 Places API는 과금형이며 billing 활성화가 필요하고, SKU 기준 pay-as-you-go 구조다.  ￼
+
+장점
+	•	공식 API
+	•	안정성 높음
+	•	구조화된 JSON 응답
+	•	최신성 확인에 유리
+
+단점
+	•	요청 단위 과금
+	•	기능별 SKU 과금
+	•	많이 호출하면 비용 커짐
+	•	표시/사용 정책을 따라야 함
+
+⸻
+
+3.2 Apify
+
+Apify는 Actor 실행 기반의 데이터 수집 플랫폼이다. API v2로 Actor 실행, dataset 조회, task 관리가 가능하다. Store Actor는 monetization model로 rental, pay-per-result, pay-per-event를 가질 수 있다. Apify 공식 문서와 Academy 문서에 따르면 Store의 pay-per-result 상품들은 보통 1,000 results당 가격을 두며, 일반적인 범위는 대략 $1~$10/1,000 results 수준이다.  ￼
+
+장점
+	•	대량 후보 수집에 유리
+	•	글 소재 확장성이 좋음
+	•	dataset 형태로 다루기 쉬움
+	•	블로그용 후보 수집기로 적합
+
+단점
+	•	공식 장소 API가 아님
+	•	Actor별 가격 모델이 다름
+	•	원천 페이지 구조 변경의 영향을 받을 수 있음
+	•	데이터 최신성 검증은 별도로 설계해야 함
+
+⸻
+
+3.3 최종 방침
+
+다음과 같이 혼합 사용한다.
+	•	Apify: 대량 후보 수집
+	•	Google Places API: 최신성 확인, 필수 필드 보강, 고신뢰 상세 확인
+	•	OpenAI API: 글 생성, 요약, 검수
+	•	WordPress REST API: 발행
+
+이 구조가 비용, 확장성, 품질 측면에서 가장 현실적이다.
+WordPress REST API는 posts, media, taxonomies 등 기본 데이터 타입을 JSON으로 다루는 REST endpoint를 제공한다. /wp/v2/posts, /wp/v2/media를 사용한다.  ￼
+
+⸻
+
+4. 전체 시스템 아키텍처
+
+키워드/상황 큐
+→ Apify로 장소 후보 수집
+→ 내부 정제/필터링/점수화
+→ 필요 시 Google Places API로 최신성/세부정보 보강
+→ OpenAI로 본문 생성
+→ OpenAI + 규칙 기반 검수
+→ WordPress REST API로 발행
+→ 주기적 재검토 및 업데이트
+
+
+⸻
+
+5. 구현 목표 범위
+
+Codex는 아래 범위까지 구현 가능한 구조를 설계해야 한다.
+
+5.1 최소 기능
+	•	장소 후보 수집
+	•	정제 및 점수화
+	•	글 초안 생성
+	•	검수
+	•	WordPress 발행
+
+5.2 확장 기능
+	•	예약 발행
+	•	중복 글 방지
+	•	카테고리/태그 자동 분류
+	•	이미지 업로드
+	•	오래된 글 재검토
+	•	폐업/영업상태 변경 감지
+	•	FAQ 자동 생성
+	•	메타 설명 생성
+	•	내부링크 추천
+
+⸻
+
+6. 콘텐츠 전략
+
+6.1 글 생성 단위
+
+글은 반드시 아래 조합을 기준으로 만든다.
+
+도시 × 상황 × 장소유형 × 대상
+
+예:
+	•	후쿠오카 × 혼자 여행 × 저녁 식당 × 1인 여행자
+	•	도쿄 × 비 오는 날 × 실내 관광지 × 일반 여행자
+	•	오사카 × 부모님 동반 × 카페 × 이동 적은 코스
+	•	하네다공항 × 공항 근처 × 식당 × 환승 대기 여행자
+
+6.2 차별화 요소
+
+글에는 반드시 아래 해석이 포함되어야 한다.
+	•	한국인 입맛/여행 습관 기준
+	•	혼자 들어가기 부담이 적은지
+	•	부모님 동반 시 무리가 없는지
+	•	캐리어 이동이 쉬운지
+	•	역/공항에서 접근이 쉬운지
+	•	비 오는 날 이동 리스크가 적은지
+
+⸻
+
+7. 데이터 모델 설계
+
+7.1 Place 엔터티
+
+다음 필드를 기본으로 저장한다.
+
+{
+  "source": "apify|google",
+  "source_id": "",
+  "place_id": "",
+  "name": "",
+  "city": "",
+  "country": "",
+  "category": "",
+  "subcategories": [],
+  "address": "",
+  "lat": 0,
+  "lng": 0,
+  "rating": 0,
+  "review_count": 0,
+  "price_level": "",
+  "opening_hours": "",
+  "business_status": "",
+  "website": "",
+  "phone": "",
+  "maps_url": "",
+  "image_urls": [],
+  "review_snippets": [],
+  "last_verified_at": "",
+  "collected_at": "",
+  "raw_payload": {}
+}
+
+7.2 ArticleCandidate 엔터티
+
+{
+  "topic_key": "fukuoka-solo-dinner",
+  "city": "Fukuoka",
+  "country": "Japan",
+  "scenario": "solo_travel",
+  "place_type": "restaurant",
+  "audience": "korean_traveler",
+  "query_text": "후쿠오카 혼자 여행 저녁 식당 추천",
+  "candidate_place_ids": [],
+  "ranking_version": "v1",
+  "status": "draft|reviewed|published|rejected"
+}
+
+7.3 PublishedArticle 엔터티
+
+{
+  "wp_post_id": 0,
+  "slug": "",
+  "title": "",
+  "topic_key": "",
+  "candidate_place_ids": [],
+  "published_at": "",
+  "needs_refresh": false,
+  "last_content_reviewed_at": "",
+  "last_data_verified_at": ""
+}
+
+
+⸻
+
+8. 장소 수집 로직
+
+8.1 입력
+
+입력은 문자열 하나가 아니라 구조화된 query object여야 한다.
+
+{
+  "city": "Fukuoka",
+  "country": "Japan",
+  "scenario": "solo_travel",
+  "place_type": "restaurant",
+  "keywords": ["혼자 여행", "저녁", "1인 식당", "역 근처"]
+}
+
+8.2 수집 단계
+	1.	Apify Actor 실행
+	2.	dataset 결과 저장
+	3.	정규화
+	4.	중복 제거
+	5.	1차 품질 필터링
+	6.	상위 후보에 대해 Google Places API로 보강 가능
+
+8.3 중복 제거 규칙
+
+다음 조합을 기준으로 near-duplicate 제거를 구현한다.
+	•	name normalized
+	•	address normalized
+	•	lat/lng proximity
+	•	same chain name + same neighborhood
+
+⸻
+
+9. 점수화 로직
+
+OpenAI에게 장소 선정까지 맡기지 말고, 먼저 규칙 기반 점수화를 한다.
+
+9.1 기본 점수 항목
+
+예시:
+
+총점 = 평점 점수 + 리뷰수 점수 + 접근성 점수 + 상황 적합성 점수 + 안정성 점수 - 리스크 점수
+
+항목 예시
+	•	평점 점수: rating 기반
+	•	리뷰 수 점수: review_count 기반
+	•	접근성 점수: 역/공항/중심지 거리
+	•	상황 적합성 점수: scenario와 category 매칭
+	•	안정성 점수: business_status, verified freshness
+	•	리스크 점수: 리뷰 수 부족, 최근성 부족, 정보 누락
+
+9.2 상황별 가중치
+
+solo_travel
+	•	1인 이용 적합성 가중치 증가
+	•	접근성 가중치 증가
+	•	고급/대형 매장 가중치 낮춤 가능
+
+rainy_day
+	•	indoor category 가중치 증가
+	•	역 접근성 가중치 증가
+
+parents_trip
+	•	이동량 적음
+	•	과도한 대기/복잡한 동선 배제
+	•	평점 안정성 우선
+
+⸻
+
+10. Google Places API 사용 원칙
+
+Google Places API는 비용이 발생하므로 전량 사용하지 말고 보강용으로 제한한다. Places API는 billing이 필요하고, SKU별 pay-as-you-go 구조다.  ￼
+
+10.1 사용 시점
+
+다음 조건에서만 호출한다.
+	•	최종 후보 상위 N개
+	•	오래된 데이터 재검증
+	•	business_status 확인 필요
+	•	website / phone / opening hours / review count 보강 필요
+
+10.2 비용 절감 원칙
+	•	필요한 필드만 요청
+	•	article당 detail 호출 수 제한
+	•	캐시 사용
+	•	검증 주기 설정
+
+⸻
+
+11. OpenAI 사용 원칙
+
+OpenAI는 후보 수집기가 아니라 서술기 + 편집기 + 검수기로 사용한다.
+
+11.1 생성 작업
+	•	제목 3안 생성
+	•	서론 작성
+	•	장소별 추천 이유 요약
+	•	FAQ 생성
+	•	메타 설명 생성
+	•	CTA 생성
+	•	내부 링크 문구 생성
+
+11.2 검수 작업
+
+다음 항목을 JSON으로 반환하게 한다.
+
+{
+  "pass": true,
+  "score": 86,
+  "issues": [
+    {
+      "type": "freshness",
+      "severity": "medium",
+      "message": "영업시간 정보는 최신 확인 필요"
+    }
+  ],
+  "required_actions": [
+    "최신 영업 상태 확인 문구 추가"
+  ]
+}
+
+11.3 금지 사항
+	•	장소 선정 자체를 전적으로 LLM에 맡기지 말 것
+	•	사실 검증 최종 판정기로 쓰지 말 것
+	•	가격/영업시간/휴무를 단정적으로 생성하지 말 것
+
+⸻
+
+12. 글 구조 템플릿
+
+모든 글은 아래 구조를 기본으로 한다.
+
+1. 제목
+2. 요약
+3. 이런 사람에게 추천
+4. 추천 장소 목록
+   - 장소명
+   - 추천 이유
+   - 주의점
+   - 위치/접근성 요약
+5. 짧은 동선 제안
+6. 방문 전 체크사항
+7. FAQ
+8. 결론
+
+12.1 문체 규칙
+	•	한국어
+	•	과장 금지
+	•	“무조건”, “최고”, “절대” 같은 단정 표현 지양
+	•	최신성 불확실 정보는 확인 유도 문구 추가
+
+예:
+	•	“방문 전 최신 영업시간은 지도 또는 공식 페이지에서 다시 확인하는 편이 안전합니다.”
+
+⸻
+
+13. WordPress 발행 구조
+
+WordPress REST API는 posts와 media endpoint를 제공한다. /wp/v2/posts, /wp/v2/media를 사용한다.  ￼
+
+13.1 포스트 타입
+
+최소는 일반 post로 시작한다.
+확장 시 custom post type 사용 가능.
+
+권장 taxonomy
+	•	country
+	•	city
+	•	scenario
+	•	place_type
+	•	traveler_type
+
+예:
+	•	country: japan
+	•	city: fukuoka
+	•	scenario: solo_travel
+	•	place_type: restaurant
+	•	traveler_type: korean_traveler
+
+13.2 slug 규칙
+
+{country}-{city}-{scenario}-{place_type}
+
+예:
+
+japan-fukuoka-solo-travel-restaurants
+
+13.3 상태 관리
+	•	draft
+	•	pending_review
+	•	publish
+	•	refresh_required
+
+⸻
+
+14. 예약 발행 및 갱신
+
+14.1 예약 발행
+	•	topic queue에 따라 초안 생성
+	•	검수 통과 시 scheduled publish
+	•	사람이 최종 검토 가능한 옵션 유지
+
+14.2 갱신 대상 탐지
+
+다음 조건이면 needs_refresh = true
+	•	last_data_verified_at > 30일
+	•	business_status unknown
+	•	rating/review_count 급변
+	•	source data missing
+	•	seasonality topic
+
+⸻
+
+15. 수익화 고려사항
+
+이 시스템은 단순 광고형 블로그로 끝내지 않는다.
+
+수익화 후보
+	•	여행 보험 제휴
+	•	eSIM 제휴
+	•	호텔/숙소 제휴
+	•	투어/교통패스 제휴
+	•	여행 일정표/PDF 판매
+	•	이메일 수집 후 뉴스레터
+
+수익화 삽입 위치
+	•	글 하단 CTA
+	•	FAQ 아래 추천 링크
+	•	동선 섹션 아래 관련 상품
+	•	도시별 묶음 페이지
+
+⸻
+
+16. 구현 우선순위
+
+Phase 1: MVP
+	•	장소 후보 수집
+	•	정규화
+	•	점수화
+	•	OpenAI 글 생성
+	•	WordPress 발행
+
+Phase 2
+	•	Google Places API 보강
+	•	검수 자동화
+	•	taxonomy 자동 부여
+	•	메타 설명 생성
+	•	예약 발행
+
+Phase 3
+	•	갱신 파이프라인
+	•	내부 링크 자동 추천
+	•	이미지 처리
+	•	다국어 확장 가능성 검토
+
+⸻
+
+17. Codex 작업 지시
+
+Codex는 아래 결과물을 생성해야 한다.
+
+17.1 코드 구조
+	•	Python 기준 프로젝트 구조 제안
+	•	.env 기반 설정 관리
+	•	Apify client wrapper
+	•	Google Places client wrapper
+	•	OpenAI client wrapper
+	•	WordPress client wrapper
+	•	ranking module
+	•	generation module
+	•	review module
+	•	scheduler module
+
+17.2 산출물
+	1.	프로젝트 폴더 구조
+	2.	DB 스키마 제안
+	3.	환경변수 목록
+	4.	각 API wrapper 구현
+	5.	article generation pipeline
+	6.	review pipeline
+	7.	wordpress publish pipeline
+	8.	refresh pipeline 초안
+	9.	logging / retry / deduplication 설계
+	10.	README
+
+⸻
+
+18. 환경변수 예시
+
+APIFY_TOKEN=
+GOOGLE_MAPS_API_KEY=
+OPENAI_API_KEY=
+WORDPRESS_BASE_URL=
+WORDPRESS_USERNAME=
+WORDPRESS_APP_PASSWORD=
+DB_URL=
+DEFAULT_COUNTRY=Japan
+DEFAULT_LANGUAGE=ko
+
+WordPress 인증은 REST API 인증 방식을 확인해야 한다. WordPress 문서에는 인증 관련 가이드가 있으며, 애플리케이션 비밀번호 등 설정 방식 검토가 필요하다.  ￼
+
+⸻
+
+19. 주의사항
+	•	Google Places API는 공식 과금형 API다. 과도한 호출 금지.  ￼
+	•	Apify는 Actor마다 가격 모델이 다르므로 특정 Actor 비용을 하드코딩하지 말 것. rental, pay-per-result, pay-per-event를 고려할 것.  ￼
+	•	장소 추천 글은 최신성 리스크가 크므로 “정보 재확인” 문구 자동 삽입 필수
+	•	리뷰 수가 지나치게 적은 장소는 우선 제외
+	•	단순 평점순 정렬 금지
+	•	일반 추천 블로그처럼 넓게 가지 말 것
+	•	상황별 니치 전략 유지
+
+⸻
+
+20. 최종 요약
+
+이 시스템은 다음 방향으로 구현한다.
+	•	Apify로 장소 후보를 대량 수집
+	•	내부 규칙 기반으로 필터링 및 랭킹
+	•	Google Places API로 상위 후보만 최신성/상세 보강
+	•	OpenAI로 한국어 추천 글 생성 및 검수
+	•	WordPress REST API로 발행
+	•	정기적으로 재검토 및 업데이트
+
+핵심은 이 한 줄이다.
+
+“지도 데이터 기반 추천 블로그”가 아니라, “한국인 여행자의 특정 상황을 해결하는 장소 추천 시스템”으로 구현할 것

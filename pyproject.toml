@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "japantravel"
+version = "0.1.0"
+description = "Japan travel content pipeline scaffold"
+requires-python = ">=3.11"
+readme = "README.md"
