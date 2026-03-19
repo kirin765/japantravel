@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
@@ -231,6 +232,139 @@ class PlaceRepository:
 
         return bool(row and row[0])
 
+    def fetch_recent_published_place_keys(self, limit: int = 5, status: str = "published") -> set[str]:
+        if not self.enabled or limit <= 0:
+            return set()
+
+        sql = """
+            SELECT
+                pa.place_id AS db_place_id,
+                p.external_place_id,
+                p.google_place_id,
+                pa.raw_publish_response
+            FROM published_article pa
+            JOIN place p ON p.id = pa.place_id
+            WHERE pa.status = %s
+            ORDER BY COALESCE(pa.published_at, pa.created_at) DESC
+            LIMIT %s
+        """
+
+        with connect(self.db_url) as connection:
+            connection.row_factory = dict_row
+            with connection.cursor() as cursor:
+                cursor.execute(sql, (status, limit))
+                rows = cursor.fetchall()
+
+        keys: set[str] = set()
+        for row in rows:
+            self._add_place_key(keys, row.get("db_place_id"))
+            self._add_place_key(keys, row.get("external_place_id"))
+            self._add_place_key(keys, row.get("google_place_id"))
+
+            payload = row.get("raw_publish_response") or {}
+            if isinstance(payload, str):
+                with suppress(Exception):
+                    payload = json.loads(payload)
+            if not isinstance(payload, Mapping):
+                continue
+
+            for value in payload.get("candidate_place_ids", []):
+                self._add_place_key(keys, value)
+            for value in payload.get("candidate_db_place_ids", []):
+                self._add_place_key(keys, value)
+            for snapshot in payload.get("place_snapshots", []):
+                self._add_place_keys_from_mapping(keys, snapshot)
+
+        return keys
+
+    def save_published_article(
+        self,
+        *,
+        primary_place_id: int,
+        wp_post_id: int,
+        title: str,
+        slug: str,
+        content_html: str,
+        excerpt: str = "",
+        status: str = "draft",
+        raw_publish_response: Optional[Mapping[str, Any]] = None,
+        media_urls: Optional[list[str]] = None,
+        categories: Optional[list[int]] = None,
+        tags: Optional[list[str]] = None,
+        published_at: Optional[datetime] = None,
+        article_candidate_id: Optional[int] = None,
+        created_by: str = "scheduler",
+    ) -> bool:
+        if not self.enabled:
+            return False
+        if primary_place_id <= 0 or wp_post_id <= 0:
+            return False
+
+        payload = dict(raw_publish_response or {})
+        content_hash = hashlib.sha256(f"{slug}\n{content_html}".encode("utf-8")).hexdigest()
+
+        with connect(self.db_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO published_article (
+                        place_id,
+                        article_candidate_id,
+                        wp_post_id,
+                        title,
+                        slug,
+                        content_html,
+                        excerpt,
+                        status,
+                        published_at,
+                        media_urls,
+                        categories,
+                        tags,
+                        content_hash,
+                        raw_publish_response,
+                        created_by
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT (wp_post_id) DO UPDATE
+                    SET
+                        place_id = EXCLUDED.place_id,
+                        article_candidate_id = EXCLUDED.article_candidate_id,
+                        title = EXCLUDED.title,
+                        slug = EXCLUDED.slug,
+                        content_html = EXCLUDED.content_html,
+                        excerpt = EXCLUDED.excerpt,
+                        status = EXCLUDED.status,
+                        published_at = EXCLUDED.published_at,
+                        media_urls = EXCLUDED.media_urls,
+                        categories = EXCLUDED.categories,
+                        tags = EXCLUDED.tags,
+                        content_hash = EXCLUDED.content_hash,
+                        raw_publish_response = EXCLUDED.raw_publish_response,
+                        updated_at = NOW()
+                    """,
+                    (
+                        primary_place_id,
+                        article_candidate_id,
+                        wp_post_id,
+                        title,
+                        slug,
+                        content_html,
+                        excerpt,
+                        status,
+                        published_at,
+                        media_urls or [],
+                        categories or [],
+                        tags or [],
+                        content_hash,
+                        payload,
+                        created_by,
+                    ),
+                )
+            connection.commit()
+        return True
+
     def _row_to_payload(self, row: Mapping[str, Any]) -> dict[str, Any]:
         raw_payload = row.get("raw_payload") or {}
         if isinstance(raw_payload, str):
@@ -283,6 +417,26 @@ class PlaceRepository:
             "source": self._to_str(row.get("source")) or "apify",
             "tags": tags,
         }
+
+    @staticmethod
+    def _add_place_key(target: set[str], value: Any) -> None:
+        if value is None:
+            return
+        normalized = str(value).strip()
+        if normalized:
+            target.add(normalized)
+
+    def _add_place_keys_from_mapping(self, target: set[str], payload: Any) -> None:
+        if not isinstance(payload, Mapping):
+            return
+
+        for field in ("id", "place_id", "source_id", "external_place_id", "google_place_id", "googlePlaceId", "placeId"):
+            self._add_place_key(target, payload.get(field))
+
+        raw_payload = payload.get("raw_payload")
+        if isinstance(raw_payload, Mapping):
+            for field in ("id", "place_id", "source_id", "external_place_id", "google_place_id", "googlePlaceId", "placeId"):
+                self._add_place_key(target, raw_payload.get(field))
 
     def _normalize_raw(
         self,

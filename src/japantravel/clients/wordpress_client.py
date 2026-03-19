@@ -56,11 +56,17 @@ class WordPressClient(BaseClient):
     def update_post(self, post_id: int, **fields: Any) -> Dict[str, Any]:
         return self.json_request("POST", f"/posts/{post_id}", json=fields)
 
-    def get_post(self, post_id: int) -> Dict[str, Any]:
-        return self.json_request("GET", f"/posts/{post_id}")
+    def get_post(self, post_id: int, **params: Any) -> Dict[str, Any]:
+        return self.json_request("GET", f"/posts/{post_id}", params=params or None)
 
-    def list_posts(self, **params: Any) -> Dict[str, Any]:
+    def list_posts(self, **params: Any) -> list[Dict[str, Any]]:
         return self.json_request("GET", "/posts", params=params)
+
+    def list_pages(self, **params: Any) -> list[Dict[str, Any]]:
+        return self.json_request("GET", "/pages", params=params)
+
+    def update_page(self, page_id: int, **fields: Any) -> Dict[str, Any]:
+        return self.json_request("POST", f"/pages/{page_id}", json=fields)
 
     def upload_media(self, file_path: str, filename: Optional[str] = None) -> Dict[str, Any]:
         file_name = filename or file_path.split("/")[-1]
@@ -91,6 +97,12 @@ class WordPressClient(BaseClient):
             "file": (inferred_name, response.content, response.headers.get("content-type", "application/octet-stream"))
         }
         return self.json_request("POST", "/media", files=files)
+
+    def get_media(self, media_id: int, **params: Any) -> Dict[str, Any]:
+        return self.json_request("GET", f"/media/{media_id}", params=params or None)
+
+    def update_media(self, media_id: int, **fields: Any) -> Dict[str, Any]:
+        return self.json_request("POST", f"/media/{media_id}", json=fields)
 
     def list_categories(self, **params: Any) -> list[Dict[str, Any]]:
         return self.json_request("GET", "/categories", params=params)

@@ -4,19 +4,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import html
 import logging
+import re
 from urllib.parse import quote_plus
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from ..clients import ApifyClient, GooglePlacesClient, OpenAIClient, WordPressClient
 from ..config.settings import Settings
+from ..modules.generation.formatter import build_post_featured_media_alt_text, build_post_meta_description
+from ..modules.generation.seo import to_plain_text
 from ..storage import PlaceRepository
 from ..modules.generation import GenerationPipeline
 from ..modules.refresh import RefreshPipeline
 from ..modules.ranking import selectors
 from ..modules.ranking import scorer
 from ..modules.publish import PublishPipeline
+from ..modules.publish.sitemap import verify_post_url_in_sitemap
 from ..modules.review import ReviewPipeline
 from ..shared.exceptions import ExternalServiceError
 from ..shared.models import ArticleCandidate, PublishedArticle
@@ -332,7 +337,7 @@ def reset_and_collect_from_apify_datasets(
 def content_cycle_job(context: PipelineContext | None = None, scenario: str = "solo_travel") -> Dict[str, Any]:
     """Run generate -> review -> publish sequentially from the latest DB-backed place cache."""
     ctx = _ensure_context(context)
-    logger.info("content_cycle_job started")
+    logger.info("content_cycle_job started scenario=%s", scenario)
 
     # Always reload from DB so manual Apify collections are picked up by the next scheduled cycle.
     ctx.raw_collections = []
@@ -341,33 +346,51 @@ def content_cycle_job(context: PipelineContext | None = None, scenario: str = "s
 
     generate_result = generate_job(context=ctx, scenario=scenario)
     if generate_result.get("status") != "ok":
-        return {
+        result = {
             "job": "content_cycle",
             "status": generate_result.get("status", "error"),
             "generate": generate_result,
             "review": {"job": "review", "status": "skipped", "reason": "generation failed or skipped"},
             "publish": {"job": "publish", "status": "skipped", "reason": "generation failed or skipped"},
         }
+        logger.info("content_cycle_job finished status=%s generate=%s", result["status"], generate_result.get("status"))
+        return result
 
     review_result = review_job(context=ctx)
     if review_result.get("status") != "ok":
-        return {
+        result = {
             "job": "content_cycle",
             "status": review_result.get("status", "error"),
             "generate": generate_result,
             "review": review_result,
             "publish": {"job": "publish", "status": "skipped", "reason": "review failed or skipped"},
         }
+        logger.info(
+            "content_cycle_job finished status=%s generate=%s review=%s",
+            result["status"],
+            generate_result.get("status"),
+            review_result.get("status"),
+        )
+        return result
 
     publish_result = publish_job(context=ctx)
     status = "ok" if publish_result.get("status") == "ok" else publish_result.get("status", "error")
-    return {
+    result = {
         "job": "content_cycle",
         "status": status,
         "generate": generate_result,
         "review": review_result,
         "publish": publish_result,
     }
+    logger.info(
+        "content_cycle_job finished status=%s generate=%s review=%s publish=%s published=%s",
+        status,
+        generate_result.get("status"),
+        review_result.get("status"),
+        publish_result.get("status"),
+        len(publish_result.get("published", [])) if isinstance(publish_result.get("published"), list) else 0,
+    )
+    return result
 
 
 def generate_job(context: PipelineContext | None = None, scenario: str = "solo_travel") -> Dict[str, Any]:
@@ -386,10 +409,36 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
         return {"job": "generate", "status": "error", "error": "OpenAI client is not configured"}
 
     try:
-        normalized_places = [_normalize_place(item) for item in ctx.raw_collections]
+        target_count = max(1, min(ctx.settings.recent_place_target_count, ctx.settings.top_n_candidates))
+        min_count = max(2, ctx.settings.recent_place_min_count)
+        excluded_keys = _load_recent_excluded_place_keys(ctx)
+        filtered_collections = _filter_places_by_excluded_keys(ctx.raw_collections, excluded_keys)
+        refresh_result: Dict[str, Any] | None = None
+
+        if len(filtered_collections) < target_count and ctx.settings.recent_place_force_apify_on_exhaust:
+            refresh_result = _force_collect_fresh_places(ctx, scenario=scenario)
+            if refresh_result.get("status") == "ok":
+                filtered_collections = _filter_places_by_excluded_keys(ctx.raw_collections, excluded_keys)
+
+        if len(filtered_collections) < min_count:
+            return {
+                "job": "generate",
+                "status": "skipped",
+                "reason": "insufficient_unique_places",
+                "excluded_place_count": len(excluded_keys),
+                "available_count": len(filtered_collections),
+                "refresh": refresh_result or {},
+            }
+
+        ctx.raw_collections = filtered_collections
+        normalized_places = [_normalize_place(item) for item in filtered_collections]
         ranked = scorer.score_candidates(normalized_places, scenario=scenario)
-        top = selectors.top_k(ranked, ctx.settings.top_n_candidates)
+        generation_limit = min(len(ranked), target_count)
+        top = selectors.top_k(ranked, generation_limit)
         top_payloads = [item.payload for item in top]
+
+        if not top_payloads:
+            return {"job": "generate", "status": "skipped", "reason": "no ranked candidates"}
 
         ctx.article_candidates = [
             _candidate_from_ranking(item, scenario=scenario, city=item.payload.get("city", ""), country=item.payload.get("country", ""))
@@ -412,6 +461,8 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
             payload = article.to_payload()
             payload["variant_id"] = variant_id
             payload["generation_tone"] = tone
+            payload["region"] = region
+            payload["scenario"] = scenario
             variants.append({"variant_id": variant_id, "payload": payload})
 
         ctx.generated_articles = [
@@ -422,7 +473,14 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
                 "places": top_payloads,
             }
         ]
-        return {"job": "generate", "status": "ok", "generated": len(ctx.generated_articles)}
+        return {
+            "job": "generate",
+            "status": "ok",
+            "generated": len(ctx.generated_articles),
+            "excluded_place_count": len(excluded_keys),
+            "selected_place_count": len(top_payloads),
+            "refresh": refresh_result or {},
+        }
     except Exception as exc:
         logger.error("generate_job failed: %s", exc)
         return {"job": "generate", "status": "error", "error": str(exc)}
@@ -486,17 +544,74 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
 
             payload = generated["payload"]
             title = payload.get("title") or "Untitled"
+            category_names = ["japan", payload.get("region", "asia")]
+            tag_names = [generated.get("candidate_topic", "travel"), "korean_traveler"]
+            term_ids = publisher.resolve_term_ids(categories=category_names, tags=tag_names)
+            payload = dict(payload)
+            payload["related_posts"] = _select_related_posts(
+                ctx.wp,
+                category_ids=term_ids["categories"],
+                tag_ids=term_ids["tags"],
+                exclude_title=title,
+                limit=3,
+            )
+            content_html = _format_article_content(payload)
             featured_media_urls = _collect_featured_images(generated.get("places", []), payload)
+            excerpt = build_post_meta_description(payload)
+            featured_media_alt_text = build_post_featured_media_alt_text(payload)
             result = publisher.publish(
                 title=title,
-                content=_format_article_content(payload),
+                content=content_html,
                 status=status,
-                excerpt=payload.get("summary", "")[:190],
+                excerpt=excerpt,
                 featured_media_urls=featured_media_urls,
-                categories=["japan", payload.get("region", "asia")],
-                tags=[generated.get("candidate_topic", "travel"), "korean_traveler"],
+                featured_media_alt_text=featured_media_alt_text,
+                categories=term_ids["categories"],
+                tags=term_ids["tags"],
                 dry_run=False,
             )
+            sitemap_verification: Dict[str, Any] = {}
+            if result.get("actual_status") == "publish" and result.get("post_url") and ctx.settings.wordpress_base_url:
+                sitemap_verification = verify_post_url_in_sitemap(
+                    ctx.settings.wordpress_base_url,
+                    str(result.get("post_url")),
+                ).to_payload()
+                if not sitemap_verification.get("found", False):
+                    logger.warning(
+                        "published post missing from sitemap post_id=%s url=%s checked=%s error=%s",
+                        result.get("post_id"),
+                        result.get("post_url"),
+                        sitemap_verification.get("checked_urls", []),
+                        sitemap_verification.get("error", ""),
+                    )
+            if sitemap_verification:
+                result["sitemap_verification"] = sitemap_verification
+
+            primary_place_db_id = _first_place_db_id(places)
+            if ctx.place_repo is not None and primary_place_db_id is not None:
+                db_status = _map_wp_status_to_db_status(result.get("actual_status", status))
+                raw_publish_response = dict(result)
+                raw_publish_response["candidate_place_ids"] = _candidate_place_keys(places, payload)
+                raw_publish_response["candidate_db_place_ids"] = _candidate_db_place_ids(places)
+                raw_publish_response["place_snapshots"] = places if isinstance(places, list) else []
+                raw_publish_response["selected_variant_id"] = generated.get("selected_variant_id")
+                raw_publish_response["review"] = review
+                saved = ctx.place_repo.save_published_article(
+                    primary_place_id=primary_place_db_id,
+                    wp_post_id=int(result.get("post_id") or 0),
+                    title=title,
+                    slug=result.get("slug", ""),
+                    content_html=content_html,
+                    excerpt=excerpt,
+                    status=db_status,
+                    raw_publish_response=raw_publish_response,
+                    media_urls=result.get("featured_media_ids", []),
+                    categories=result.get("term_ids", {}).get("categories", []),
+                    tags=[str(tag) for tag in tag_names if str(tag).strip()],
+                    published_at=datetime.now(timezone.utc) if result.get("actual_status") == "publish" else None,
+                )
+                if not saved:
+                    logger.warning("publish_job could not persist published_article for wp_post_id=%s", result.get("post_id"))
 
             post = PublishedArticle(
                 wp_post_id=result.get("post_id") or 0,
@@ -525,6 +640,223 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
     except Exception as exc:
         logger.error("publish_job failed: %s", exc)
         return {"job": "publish", "status": "error", "error": str(exc)}
+
+
+def _load_recent_excluded_place_keys(ctx: PipelineContext) -> set[str]:
+    limit = max(ctx.settings.recent_published_exclude_count, 0)
+    if limit <= 0:
+        return set()
+
+    keys: set[str] = set()
+    if ctx.place_repo is not None:
+        try:
+            keys.update(ctx.place_repo.fetch_recent_published_place_keys(limit=limit, status="published"))
+        except Exception as exc:
+            logger.warning("could not load recent published place keys from DB: %s", exc)
+
+    if ctx.wp is not None:
+        try:
+            posts = ctx.wp.list_posts(per_page=limit, orderby="date", order="desc", status="publish")
+            keys.update(_extract_place_keys_from_wp_posts(posts))
+        except Exception as exc:
+            logger.warning("could not load recent published posts from WordPress: %s", exc)
+
+    return {str(value).strip() for value in keys if str(value).strip()}
+
+
+def _extract_place_keys_from_wp_posts(posts: Any) -> set[str]:
+    if not isinstance(posts, list):
+        return set()
+
+    keys: set[str] = set()
+    for post in posts:
+        if not isinstance(post, Mapping):
+            continue
+        content = (post.get("content") or {}).get("rendered", "")
+        keys.update(_extract_place_keys_from_wp_content(content))
+    return keys
+
+
+def _extract_place_keys_from_wp_content(content: Any) -> set[str]:
+    if not content:
+        return set()
+    normalized = html.unescape(str(content))
+    matches = re.findall(r"query_place_id=([^&\"'\\s<]+)", normalized)
+    return {match.strip() for match in matches if match.strip()}
+
+
+def _filter_places_by_excluded_keys(items: list[dict[str, Any]], excluded_keys: set[str]) -> list[dict[str, Any]]:
+    if not excluded_keys:
+        return list(items)
+
+    filtered: list[dict[str, Any]] = []
+    skipped = 0
+    for item in items:
+        item_keys = _place_keys(item)
+        if item_keys and item_keys.intersection(excluded_keys):
+            skipped += 1
+            continue
+        filtered.append(item)
+
+    logger.info("generate_job filtered %s places using %s recent published keys", skipped, len(excluded_keys))
+    return filtered
+
+
+def _place_keys(item: Mapping[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    raw_payload = item.get("raw_payload") or {}
+    if not isinstance(raw_payload, Mapping):
+        raw_payload = {}
+
+    for value in (
+        item.get("id"),
+        item.get("place_id"),
+        item.get("source_id"),
+        item.get("external_place_id"),
+        item.get("google_place_id"),
+        raw_payload.get("id"),
+        raw_payload.get("place_id"),
+        raw_payload.get("placeId"),
+        raw_payload.get("google_place_id"),
+        raw_payload.get("googlePlaceId"),
+    ):
+        if value is None:
+            continue
+        normalized = str(value).strip()
+        if normalized:
+            keys.add(normalized)
+    return keys
+
+
+def _force_collect_fresh_places(ctx: PipelineContext, scenario: str) -> Dict[str, Any]:
+    if ctx.apify is None or not ctx.settings.apify_actor_id:
+        return {"status": "skipped", "reason": "apify not configured"}
+
+    payload = _build_apify_input(ctx.settings)
+    run_result: Dict[str, Any] = {}
+    try:
+        settled = _run_apify_with_fallback(ctx.apify, ctx.settings.apify_actor_id, payload)
+        if not settled.get("succeeded", False):
+            return {
+                "status": "error",
+                "error": settled.get("error", "Apify run did not succeed."),
+                "run_result": settled.get("run", {}),
+            }
+
+        run_result = settled.get("run", {})
+        run_id = run_result.get("id")
+        if not run_id:
+            return {"status": "error", "error": "Apify run id not returned", "run_result": run_result}
+
+        raw_items = _apify_payload(ctx.apify.get_run_items(run_id))
+        items = raw_items.get("items", []) if isinstance(raw_items, Mapping) else raw_items
+        if not isinstance(items, list):
+            return {"status": "error", "error": "Unexpected Apify items format", "run_result": run_result}
+
+        upsert_summary: Dict[str, Any] = {}
+        if ctx.place_repo is not None:
+            upsert = ctx.place_repo.upsert_places(
+                items,
+                source="apify",
+                actor_id=ctx.settings.apify_actor_id,
+                dataset_id=_run_dataset_id(run_result),
+                conflict_mode="update",
+            )
+            upsert_summary = {
+                "fetched_count": upsert.fetched_count,
+                "inserted_count": upsert.inserted_count,
+                "skipped_count": upsert.skipped_count,
+                "errors": upsert.errors,
+            }
+            ctx.raw_collections = _load_reusable_candidates(ctx, scenario=f"{scenario}_refresh")
+        else:
+            ctx.raw_collections = list(items)
+
+        return {
+            "status": "ok",
+            "count": len(ctx.raw_collections),
+            "run_result": run_result,
+            "upsert": upsert_summary,
+        }
+    except Exception as exc:
+        logger.warning("force fresh Apify collection failed: %s", exc)
+        return {"status": "error", "error": str(exc), "run_result": run_result}
+
+
+def _first_place_db_id(places: Any) -> int | None:
+    if not isinstance(places, list):
+        return None
+    for item in places:
+        if not isinstance(item, Mapping):
+            continue
+        value = item.get("id")
+        if isinstance(value, int) and value > 0:
+            return value
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
+def _candidate_place_keys(places: Any, payload: Mapping[str, Any]) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    if isinstance(places, list):
+        for item in places:
+            if not isinstance(item, Mapping):
+                continue
+            for key in _place_keys(item):
+                if key not in seen:
+                    seen.add(key)
+                    keys.append(key)
+
+    for section in payload.get("place_sections", []):
+        if not isinstance(section, Mapping):
+            continue
+        value = section.get("place_id") or section.get("id")
+        if value is None:
+            continue
+        normalized = str(value).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            keys.append(normalized)
+
+    return keys
+
+
+def _candidate_db_place_ids(places: Any) -> list[int]:
+    ids: list[int] = []
+    seen: set[int] = set()
+    if not isinstance(places, list):
+        return ids
+
+    for item in places:
+        if not isinstance(item, Mapping):
+            continue
+        value = item.get("id")
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0 and parsed not in seen:
+            seen.add(parsed)
+            ids.append(parsed)
+    return ids
+
+
+def _map_wp_status_to_db_status(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized == "publish":
+        return "published"
+    if normalized in {"future", "pending"}:
+        return "scheduled"
+    if normalized == "draft":
+        return "draft"
+    return "failed"
 
 
 def refresh_job(context: PipelineContext | None = None) -> Dict[str, Any]:
@@ -647,6 +979,80 @@ def _topic_key(candidate: ArticleCandidate) -> str:
     return candidate.topic_key or f"{candidate.country.lower()}-{candidate.scenario}-{candidate.place_type}"
 
 
+def _select_related_posts(
+    wp: WordPressClient,
+    category_ids: list[int],
+    tag_ids: list[int],
+    exclude_title: str = "",
+    limit: int = 3,
+) -> list[dict[str, str]]:
+    selected: list[dict[str, str]] = []
+    seen: set[str] = set()
+    normalized_title = to_plain_text(exclude_title).lower()
+
+    queries: list[dict[str, Any]] = []
+    if category_ids and tag_ids:
+        queries.append({"categories": ",".join(str(item) for item in category_ids), "tags": ",".join(str(item) for item in tag_ids)})
+    if category_ids:
+        queries.append({"categories": ",".join(str(item) for item in category_ids)})
+    if tag_ids:
+        queries.append({"tags": ",".join(str(item) for item in tag_ids)})
+    queries.append({})
+
+    for query in queries:
+        try:
+            posts = wp.list_posts(
+                per_page=max(limit * 3, 6),
+                orderby="date",
+                order="desc",
+                status="publish",
+                **query,
+            )
+        except Exception as exc:
+            logger.warning("related post query failed params=%s error=%s", query, exc)
+            continue
+
+        for post in posts:
+            normalized = _normalize_related_post(post)
+            if normalized is None:
+                continue
+            if normalized["slug"] in seen or normalized["title"].lower() == normalized_title:
+                continue
+            if _looks_like_placeholder_content(normalized["title"], normalized["slug"]):
+                continue
+            seen.add(normalized["slug"])
+            selected.append(normalized)
+            if len(selected) >= limit:
+                return selected
+
+    return selected
+
+
+def _normalize_related_post(post: Mapping[str, Any]) -> dict[str, str] | None:
+    title = to_plain_text((post.get("title") or {}).get("rendered") if isinstance(post.get("title"), Mapping) else post.get("title"))
+    url = to_plain_text(post.get("link"))
+    slug = to_plain_text(post.get("slug"))
+    if not title or not url:
+        return None
+    return {"title": title, "url": url, "slug": slug}
+
+
+def _looks_like_placeholder_content(title: str, slug: str) -> bool:
+    normalized_title = to_plain_text(title).lower()
+    normalized_slug = to_plain_text(slug).lower()
+    if not normalized_title:
+        return True
+    if normalized_slug in {"hello-world", "sample-page"}:
+        return True
+    if normalized_title in {"안녕하세요", "예제 페이지"}:
+        return True
+    if "smoke-test" in normalized_slug or "smoke test" in normalized_title:
+        return True
+    if re.fullmatch(r"\d+(?:-\d+)?", normalized_slug):
+        return True
+    return False
+
+
 def _collect_featured_images(places: Any, payload: Mapping[str, Any]) -> list[str]:
     images: list[str] = []
     for place in places:
@@ -669,7 +1075,6 @@ def _collect_image_urls(obj: Mapping[str, Any]) -> list[str]:
         "photoUrl",
         "imageUrl",
         "src",
-        "url",
         "thumbnail",
         "thumbnails",
     ):
@@ -689,7 +1094,7 @@ def _collect_image_urls(obj: Mapping[str, Any]) -> list[str]:
                         fallback = item.get(fallback_key)
                         if isinstance(fallback, str):
                             raw_urls.append(fallback.strip())
-    return list(dict.fromkeys(raw_urls))
+    return list(dict.fromkeys([url for url in raw_urls if _is_probable_image_url(url)]))
 
 
 def _collect_maps_url(obj: Mapping[str, Any]) -> str:
@@ -725,6 +1130,21 @@ def _is_http_url(value: Any) -> bool:
     return isinstance(value, str) and value.lower().startswith(("http://", "https://"))
 
 
+def _is_probable_image_url(value: Any) -> bool:
+    if not _is_http_url(value):
+        return False
+    lowered = str(value).lower().strip()
+    if any(token in lowered for token in ("google.com/maps", "/maps/search", "/search/?api=1", "/place/", "output=embed")):
+        return False
+    if re.search(r"\.(jpg|jpeg|png|webp|gif)(?:\?|$)", lowered):
+        return True
+    if any(host in lowered for host in ("googleusercontent.com", "ggpht.com", "streetviewpixels-pa.googleapis.com")):
+        return True
+    if "googleapis.com/v1/thumbnail" in lowered:
+        return True
+    return False
+
+
 def _is_number(value: Any) -> bool:
     try:
         float(value)
@@ -743,9 +1163,9 @@ def _ab_score(review: Mapping[str, Any]) -> int:
 
 
 def _format_article_content(payload: Mapping[str, Any]) -> str:
-    from ..modules.generation.formatter import format_markdown_payload
+    from ..modules.generation.formatter import format_wordpress_html_payload
 
-    return format_markdown_payload(payload, include_map_iframe=True)
+    return format_wordpress_html_payload(payload, include_map_iframe=True)
 
 
 def _wait_for_run_result(apify: ApifyClient, run_id: str, timeout_seconds: int = 900) -> Dict[str, Any]:

@@ -23,6 +23,12 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from ...clients.openai_client import OpenAIClient
 from ...shared.exceptions import ExternalServiceError
 from . import prompt_templates as templates
+from .seo import (
+    build_meta_description,
+    build_primary_keyword,
+    build_secondary_topics,
+    normalize_generated_text,
+)
 
 
 @dataclass
@@ -30,11 +36,28 @@ class PlaceSection:
     """A single place-focused section in the final article."""
 
     place_id: str
+    place_name: str
     title: str
     body: str
     image_urls: list[str]
     maps_url: str
     map_embed_url: str
+
+
+@dataclass
+class SeoMetadata:
+    """Lightweight SEO metadata stored alongside a generated article."""
+
+    primary_keyword: str
+    secondary_topics: List[str]
+    meta_description: str
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "primary_keyword": self.primary_keyword,
+            "secondary_topics": list(self.secondary_topics),
+            "meta_description": self.meta_description,
+        }
 
 
 @dataclass
@@ -49,6 +72,7 @@ class GeneratedArticle:
     checklist: List[str]
     faq: List[Dict[str, str]]
     conclusion: str
+    seo: SeoMetadata
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -56,10 +80,16 @@ class GeneratedArticle:
             "summary": self.summary,
             "intro": self.intro,
             "place_sections": [
-                {"place_id": section.place_id, "title": section.title, "body": section.body}
+                {
+                    "place_id": section.place_id,
+                    "place_name": section.place_name,
+                    "title": section.title,
+                    "body": section.body,
+                }
                 if not (section.image_urls or section.maps_url or section.map_embed_url)
                 else {
                     "place_id": section.place_id,
+                    "place_name": section.place_name,
                     "title": section.title,
                     "body": section.body,
                     "image_urls": section.image_urls,
@@ -72,6 +102,7 @@ class GeneratedArticle:
             "checklist": self.checklist,
             "faq": self.faq,
             "conclusion": self.conclusion,
+            "seo": self.seo.to_payload(),
         }
 
 
@@ -120,6 +151,20 @@ class GenerationPipeline:
         checklist = self._generate_checklist(selected=selected, context=draft_context)
         faq = self._generate_faq(selected=selected, context=draft_context)
         conclusion = self._generate_conclusion(selected=selected, context=draft_context)
+        seo = SeoMetadata(
+            primary_keyword=build_primary_keyword(
+                title=title,
+                region=str(draft_context.get("region", "")),
+                scenario=str(draft_context.get("scenario", self.scenario)),
+            ),
+            secondary_topics=build_secondary_topics([section.place_name for section in place_sections]),
+            meta_description=build_meta_description(
+                title=title,
+                summary=summary,
+                intro=intro,
+                region=str(draft_context.get("region", "")),
+            ),
+        )
 
         return GeneratedArticle(
             title=title,
@@ -130,6 +175,7 @@ class GenerationPipeline:
             checklist=checklist,
             faq=faq,
             conclusion=conclusion,
+            seo=seo,
         )
 
     def _build_context(
@@ -196,11 +242,21 @@ class GenerationPipeline:
             scenario=context["scenario"],
             place_count=len(selected),
         )
-        return self.client.generate(system_prompt=templates.SYSTEM, user_prompt=user_prompt, context={"selected_places": selected, **context})
+        raw = self.client.generate(
+            system_prompt=templates.SYSTEM,
+            user_prompt=user_prompt,
+            context={"selected_places": selected, **context},
+        )
+        return normalize_generated_text(raw, drop_heading_lines=True)
 
     def _generate_intro(self, selected: Sequence[Mapping[str, Any]], context: Mapping[str, Any]) -> str:
         user_prompt = templates.INTRO_PROMPT.format(region=context["region"], scenario=context["scenario"])
-        return self.client.generate(system_prompt=templates.SYSTEM, user_prompt=user_prompt, context={"selected_places": selected, **context})
+        raw = self.client.generate(
+            system_prompt=templates.SYSTEM,
+            user_prompt=user_prompt,
+            context={"selected_places": selected, **context},
+        )
+        return normalize_generated_text(raw, drop_heading_lines=True)
 
     def _generate_place_sections(
         self,
@@ -223,12 +279,13 @@ class GenerationPipeline:
                 user_prompt=section_prompt,
                 context={"place": place, "display_rating": rating, "review_count": review_count, **context},
             )
-            title = self._build_section_title(name=name, rating=rating, review_count=review_count)
+            title = self._build_section_title(name=name)
             sections.append(
                 PlaceSection(
                     place_id=str(place.get("id", place.get("place_id", ""))),
+                    place_name=name,
                     title=title,
-                    body=content,
+                    body=normalize_generated_text(content, drop_heading_lines=True),
                     image_urls=self._collect_image_urls(place),
                     maps_url=str(place.get("maps_url", "") or ""),
                     map_embed_url=str(place.get("maps_embed_url", "") or ""),
@@ -237,15 +294,9 @@ class GenerationPipeline:
         return sections
 
     @staticmethod
-    def _build_section_title(name: str, rating: str, review_count: int) -> str:
-        badge = "🌟"
-        if review_count > 3000:
-            badge = "🔥"
-        if rating and rating != "0.0":
-            return f"{badge} {name} ({rating}, 리뷰 {review_count}개)"
-        if review_count:
-            return f"{badge} {name} (리뷰 {review_count}개)"
-        return f"{badge} {name} (새로운 후보)"
+    def _build_section_title(name: str) -> str:
+        cleaned = normalize_generated_text(name, drop_heading_lines=True)
+        return cleaned or "추천 장소"
 
     @staticmethod
     def _to_display_rating(place: Mapping[str, Any]) -> str:
@@ -335,11 +386,12 @@ class GenerationPipeline:
             scenario=context["scenario"],
             region=context["region"],
         )
-        return self.client.generate(
+        raw = self.client.generate(
             system_prompt=templates.SYSTEM,
             user_prompt=user_prompt,
             context={"selected_places": selected, **context},
         )
+        return normalize_generated_text(raw, drop_heading_lines=True)
 
     def _retry_generate(self, system_prompt: str, user_prompt: str, context: Mapping[str, Any]) -> str:
         # Retry only around generation logic where transient model errors may occur
@@ -355,7 +407,7 @@ class GenerationPipeline:
 
     @staticmethod
     def _normalize_route_suggestion(raw: str, selected: Sequence[Mapping[str, Any]]) -> str:
-        cleaned = str(raw or "").replace("**", "").replace("###", "").strip()
+        cleaned = normalize_generated_text(raw, drop_heading_lines=True)
         cleaned = re.sub(r"\r\n?", "\n", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         if re.search(r"(?m)^\s*1\.\s+", cleaned) and re.search(r"(?m)^\s*2\.\s+", cleaned) and re.search(r"(?m)^\s*3\.\s+", cleaned):

@@ -49,6 +49,24 @@ class PublishPipeline:
         self.wp = wp_client
         self.logger = logging.getLogger(self.__class__.__name__)
 
+    def resolve_term_ids(
+        self,
+        categories: Optional[Sequence[Any]] = None,
+        tags: Optional[Sequence[Any]] = None,
+    ) -> Dict[str, List[int]]:
+        return {
+            "categories": self._resolve_terms(
+                term_values=categories or [],
+                resolve_fn=self._ensure_category,
+                field_name="카테고리",
+            ),
+            "tags": self._resolve_terms(
+                term_values=tags or [],
+                resolve_fn=self._ensure_tag,
+                field_name="태그",
+            ),
+        }
+
     def publish(
         self,
         title: str,
@@ -60,6 +78,7 @@ class PublishPipeline:
         featured_media_urls: Optional[Sequence[Any]] = None,
         featured_media: Optional[Any] = None,
         excerpt: str = "",
+        featured_media_alt_text: str = "",
         dry_run: bool = False,
         **extra_fields: Any,
     ) -> Dict[str, Any]:
@@ -67,16 +86,9 @@ class PublishPipeline:
         normalized_title = self._normalize_wp_title(title)
         final_slug = self._build_slug(slug or normalized_title)
 
-        category_ids = self._resolve_terms(
-            term_values=categories or [],
-            resolve_fn=self._ensure_category,
-            field_name="카테고리",
-        )
-        tag_ids = self._resolve_terms(
-            term_values=tags or [],
-            resolve_fn=self._ensure_tag,
-            field_name="태그",
-        )
+        term_ids = self.resolve_term_ids(categories=categories, tags=tags)
+        category_ids = term_ids["categories"]
+        tag_ids = term_ids["tags"]
         featured_media_ids: List[int] = []
         featured_media_id = None
         try:
@@ -124,6 +136,7 @@ class PublishPipeline:
 
         response = self.wp.create_post(**payload)
         media_ids = list(dict.fromkeys([featured_media_id] + featured_media_ids)) if featured_media_id else featured_media_ids
+        self._update_media_alt_text(media_ids, featured_media_alt_text)
         return {
             "requested_status": status,
             "actual_status": response.get("status", normalized_status),
@@ -310,3 +323,15 @@ class PublishPipeline:
     def _upload_media_url(self, file_url: str) -> int:
         response = self.wp.upload_media_from_url(file_url)
         return int(response["id"])
+
+    def _update_media_alt_text(self, media_ids: Sequence[int], alt_text: str) -> None:
+        cleaned = re.sub(r"\s+", " ", str(alt_text or "").strip())
+        if not cleaned:
+            return
+        for media_id in media_ids:
+            if not isinstance(media_id, int) or media_id <= 0:
+                continue
+            try:
+                self.wp.update_media(media_id, alt_text=cleaned)
+            except Exception as exc:
+                self.logger.warning("media alt text update failed media_id=%s error=%s", media_id, exc)
