@@ -1,5 +1,7 @@
 """Application entry point for manual execution."""
 
+from .config.logging import configure_logging
+from .config.settings import Settings
 from .scheduler.manager import SchedulerManager
 
 
@@ -8,7 +10,9 @@ def main() -> None:
 
     Actual job registration is delegated to SchedulerManager.
     """
-    manager = SchedulerManager()
+    settings = Settings()
+    configure_logging(settings)
+    manager = SchedulerManager(settings=settings)
     manager.run_forever()
 
 

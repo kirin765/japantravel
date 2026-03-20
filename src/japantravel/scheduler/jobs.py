@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import html
 import logging
 import re
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
@@ -18,7 +19,6 @@ from ..modules.generation.seo import to_plain_text
 from ..storage import PlaceRepository
 from ..modules.generation import GenerationPipeline
 from ..modules.refresh import RefreshPipeline
-from ..modules.ranking import selectors
 from ..modules.ranking import scorer
 from ..modules.publish import PublishPipeline
 from ..modules.publish.sitemap import verify_post_url_in_sitemap
@@ -64,6 +64,25 @@ class PipelineContext:
         if not db_url:
             return None
         return PlaceRepository(db_url)
+
+
+@dataclass
+class RecentPostSignature:
+    post_id: int
+    title: str
+    slug: str
+    link: str = ""
+    title_tokens: set[str] = field(default_factory=set)
+    place_keys: set[str] = field(default_factory=set)
+    region_key: str = ""
+    region_label: str = ""
+
+
+@dataclass
+class RegionCluster:
+    region_key: str
+    region_label: str
+    ranked_items: List["scorer.RankItem"] = field(default_factory=list)
 
 
 def _init_client(name: str, constructor):
@@ -433,21 +452,44 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
         ctx.raw_collections = filtered_collections
         normalized_places = [_normalize_place(item) for item in filtered_collections]
         ranked = scorer.score_candidates(normalized_places, scenario=scenario)
-        generation_limit = min(len(ranked), target_count)
-        top = selectors.top_k(ranked, generation_limit)
+        recent_signatures = _load_recent_post_signatures(ctx)
+        selected_cluster = _select_region_cluster(
+            ranked_items=ranked,
+            recent_signatures=recent_signatures,
+            target_count=target_count,
+            min_count=min_count,
+            title_threshold=ctx.settings.recent_title_token_threshold,
+        )
+
+        if selected_cluster is None:
+            return {
+                "job": "generate",
+                "status": "skipped_duplicate_topic",
+                "reason": "recent_region_or_title_conflict",
+                "excluded_place_count": len(excluded_keys),
+                "available_count": len(filtered_collections),
+                "recent_post_count": len(recent_signatures),
+            }
+
+        top = selected_cluster.ranked_items[:target_count]
         top_payloads = [item.payload for item in top]
+        region = selected_cluster.region_label or _place_region_label(top_payloads[0]) or "Tokyo"
 
         if not top_payloads:
             return {"job": "generate", "status": "skipped", "reason": "no ranked candidates"}
 
         ctx.article_candidates = [
-            _candidate_from_ranking(item, scenario=scenario, city=item.payload.get("city", ""), country=item.payload.get("country", ""))
+            _candidate_from_ranking(
+                item,
+                scenario=scenario,
+                city=region,
+                country=item.payload.get("country", ""),
+            )
             for item in top
         ]
 
         # generate two variants for A/B selection
         candidate_payload = top_payloads
-        region = (ctx.article_candidates[0].city or "Tokyo")
         generator = GenerationPipeline(openai_client=ctx.openai, scenario=scenario, max_sections=min(len(candidate_payload), 6))
         variants = []
         for variant_id, tone in [("A", "friendly"), ("B", "warm")]:
@@ -462,12 +504,14 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
             payload["variant_id"] = variant_id
             payload["generation_tone"] = tone
             payload["region"] = region
+            payload["region_key"] = selected_cluster.region_key
             payload["scenario"] = scenario
             variants.append({"variant_id": variant_id, "payload": payload})
 
         ctx.generated_articles = [
             {
                 "candidate_topic": _topic_key(ctx.article_candidates[0]),
+                "region_key": selected_cluster.region_key,
                 "variants": variants,
                 "payload": variants[0]["payload"],
                 "places": top_payloads,
@@ -479,6 +523,7 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
             "generated": len(ctx.generated_articles),
             "excluded_place_count": len(excluded_keys),
             "selected_place_count": len(top_payloads),
+            "selected_region_key": selected_cluster.region_key,
             "refresh": refresh_result or {},
         }
     except Exception as exc:
@@ -535,6 +580,8 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
     publisher = PublishPipeline(wp_client=ctx.wp)
     published: list[Dict[str, Any]] = []
     try:
+        recent_signatures = _load_recent_post_signatures(ctx)
+        duplicate_skips = 0
         for generated in ctx.generated_articles:
             places = generated.get("places") or []
             review = generated.get("review") or {}
@@ -544,6 +591,33 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
 
             payload = generated["payload"]
             title = payload.get("title") or "Untitled"
+            region_key = _payload_region_key(payload, places)
+            duplicate_match, duplicate_reason = _find_recent_duplicate_signature(
+                title=title,
+                region_key=region_key,
+                recent_signatures=recent_signatures,
+                threshold=ctx.settings.recent_title_token_threshold,
+            )
+            if duplicate_match is not None:
+                duplicate_skips += 1
+                logger.info(
+                    "publish_job skipped duplicate topic title=%s region_key=%s reason=%s recent_post_id=%s",
+                    title,
+                    region_key,
+                    duplicate_reason,
+                    duplicate_match.post_id,
+                )
+                published.append(
+                    {
+                        "post_id": None,
+                        "status": "skipped_duplicate_topic",
+                        "reason": duplicate_reason,
+                        "title": title,
+                        "recent_post_id": duplicate_match.post_id,
+                    }
+                )
+                continue
+
             category_names = ["japan", payload.get("region", "asia")]
             tag_names = [generated.get("candidate_topic", "travel"), "korean_traveler"]
             term_ids = publisher.resolve_term_ids(categories=category_names, tags=tag_names)
@@ -596,6 +670,8 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
                 raw_publish_response["place_snapshots"] = places if isinstance(places, list) else []
                 raw_publish_response["selected_variant_id"] = generated.get("selected_variant_id")
                 raw_publish_response["review"] = review
+                raw_publish_response["region_key"] = region_key
+                raw_publish_response["dedupe_title_tokens"] = sorted(_title_tokens(title, result.get("slug", "")))
                 saved = ctx.place_repo.save_published_article(
                     primary_place_id=primary_place_db_id,
                     wp_post_id=int(result.get("post_id") or 0),
@@ -636,7 +712,25 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
             )
             ctx.published_articles.append(post)
             published.append({"post_id": post.wp_post_id, "status": status, "result": result})
-        return {"job": "publish", "status": "ok", "published": published}
+            recent_signatures.append(
+                RecentPostSignature(
+                    post_id=int(result.get("post_id") or 0),
+                    title=title,
+                    slug=str(result.get("slug", "")),
+                    link=str(result.get("post_url", "")),
+                    title_tokens=_title_tokens(title, str(result.get("slug", ""))),
+                    place_keys=set(_candidate_place_keys(places, payload)),
+                    region_key=region_key,
+                    region_label=str(payload.get("region", "")),
+                )
+            )
+
+        final_status = "ok"
+        if duplicate_skips and not any(item.get("post_id") for item in published):
+            final_status = "skipped_duplicate_topic"
+        elif duplicate_skips:
+            final_status = "partial"
+        return {"job": "publish", "status": final_status, "published": published}
     except Exception as exc:
         logger.error("publish_job failed: %s", exc)
         return {"job": "publish", "status": "error", "error": str(exc)}
@@ -664,6 +758,198 @@ def _load_recent_excluded_place_keys(ctx: PipelineContext) -> set[str]:
     return {str(value).strip() for value in keys if str(value).strip()}
 
 
+def _load_recent_post_signatures(ctx: PipelineContext) -> list[RecentPostSignature]:
+    limit = max(ctx.settings.recent_published_exclude_count, 0)
+    if limit <= 0 or ctx.wp is None:
+        return []
+
+    try:
+        posts = ctx.wp.list_posts(per_page=limit, orderby="date", order="desc", status="publish")
+    except Exception as exc:
+        logger.warning("could not load recent post signatures from WordPress: %s", exc)
+        return []
+
+    return _build_recent_post_signatures(posts, ctx.place_repo)
+
+
+def _build_recent_post_signatures(
+    posts: Any,
+    place_repo: PlaceRepository | None = None,
+) -> list[RecentPostSignature]:
+    if not isinstance(posts, list):
+        return []
+
+    place_rows_by_key: dict[str, Mapping[str, Any]] = {}
+    all_keys: set[str] = set()
+    for post in posts:
+        if not isinstance(post, Mapping):
+            continue
+        content = (post.get("content") or {}).get("rendered", "")
+        all_keys.update(_extract_place_key_sequence_from_wp_content(content))
+
+    if place_repo is not None and all_keys:
+        try:
+            for row in place_repo.fetch_place_summaries_by_keys(sorted(all_keys)):
+                if not isinstance(row, Mapping):
+                    continue
+                for key in (row.get("external_place_id"), row.get("google_place_id")):
+                    normalized = str(key).strip() if key is not None else ""
+                    if normalized and normalized not in place_rows_by_key:
+                        place_rows_by_key[normalized] = row
+        except Exception as exc:
+            logger.warning("could not resolve recent post place keys to place rows: %s", exc)
+
+    signatures: list[RecentPostSignature] = []
+    for post in posts:
+        if not isinstance(post, Mapping):
+            continue
+        post_id = post.get("id")
+        if not isinstance(post_id, int):
+            continue
+        title = to_plain_text((post.get("title") or {}).get("rendered") if isinstance(post.get("title"), Mapping) else post.get("title"))
+        slug = to_plain_text(post.get("slug"))
+        link = to_plain_text(post.get("link"))
+        content = (post.get("content") or {}).get("rendered", "")
+        place_key_sequence = _extract_place_key_sequence_from_wp_content(content)
+        place_keys = set(place_key_sequence)
+        region_key, region_label = _infer_recent_post_region(place_key_sequence, title, slug, place_rows_by_key)
+        signatures.append(
+            RecentPostSignature(
+                post_id=post_id,
+                title=title,
+                slug=slug,
+                link=link,
+                title_tokens=_title_tokens(title, slug),
+                place_keys=place_keys,
+                region_key=region_key,
+                region_label=region_label,
+            )
+        )
+
+    return signatures
+
+
+def _infer_recent_post_region(
+    place_keys: list[str],
+    title: str,
+    slug: str,
+    place_rows_by_key: Mapping[str, Mapping[str, Any]],
+) -> tuple[str, str]:
+    rows = [place_rows_by_key[key] for key in place_keys if key in place_rows_by_key]
+    if not rows:
+        return "", ""
+
+    title_tokens = _title_tokens(title, slug)
+    region_counts: Counter[str] = Counter()
+    label_by_key: dict[str, str] = {}
+    similarity_by_key: dict[str, float] = {}
+    first_region_key = ""
+
+    for row in rows:
+        region_label = _place_region_label(row)
+        region_key = _normalize_region_key(region_label)
+        if not region_key:
+            continue
+        if not first_region_key:
+            first_region_key = region_key
+        region_counts[region_key] += 1
+        label_by_key.setdefault(region_key, region_label)
+        similarity_by_key[region_key] = max(
+            similarity_by_key.get(region_key, 0.0),
+            _token_overlap(title_tokens, _title_tokens(region_label)),
+        )
+
+    if not region_counts:
+        return "", ""
+
+    selected_key = max(
+        region_counts,
+        key=lambda key: (
+            key == first_region_key,
+            similarity_by_key.get(key, 0.0),
+            region_counts[key],
+            len(label_by_key.get(key, "")),
+        ),
+    )
+    return selected_key, label_by_key.get(selected_key, "")
+
+
+def _select_region_cluster(
+    ranked_items: list["scorer.RankItem"],
+    recent_signatures: list[RecentPostSignature],
+    target_count: int,
+    min_count: int,
+    title_threshold: float,
+) -> RegionCluster | None:
+    clusters: dict[str, RegionCluster] = {}
+    for item in ranked_items:
+        region_label = _place_region_label(item.payload)
+        region_key = _normalize_region_key(region_label)
+        if not region_key:
+            continue
+        cluster = clusters.setdefault(region_key, RegionCluster(region_key=region_key, region_label=region_label))
+        cluster.ranked_items.append(item)
+
+    ordered = sorted(
+        clusters.values(),
+        key=lambda cluster: sum(item.score for item in cluster.ranked_items[:target_count]),
+        reverse=True,
+    )
+    for cluster in ordered:
+        if len(cluster.ranked_items) < min_count:
+            continue
+        if _cluster_conflicts_with_recent(cluster, recent_signatures, title_threshold):
+            continue
+        return cluster
+    return None
+
+
+def _cluster_conflicts_with_recent(
+    cluster: RegionCluster,
+    recent_signatures: list[RecentPostSignature],
+    title_threshold: float,
+) -> bool:
+    region_tokens = _title_tokens(cluster.region_label)
+    for signature in recent_signatures:
+        if signature.region_key and signature.region_key == cluster.region_key:
+            return True
+        if region_tokens and signature.title_tokens and _token_overlap(region_tokens, signature.title_tokens) >= title_threshold:
+            return True
+    return False
+
+
+def _find_recent_duplicate_signature(
+    title: str,
+    region_key: str,
+    recent_signatures: list[RecentPostSignature],
+    threshold: float,
+) -> tuple[RecentPostSignature | None, str]:
+    normalized_region_key = _normalize_region_key(region_key)
+    if normalized_region_key:
+        for signature in recent_signatures:
+            if signature.region_key and signature.region_key == normalized_region_key:
+                return signature, "recent_region"
+
+    title_tokens = _title_tokens(title)
+    for signature in recent_signatures:
+        if title_tokens and signature.title_tokens and _token_overlap(title_tokens, signature.title_tokens) >= threshold:
+            return signature, "recent_title_similarity"
+    return None, ""
+
+
+def _payload_region_key(payload: Mapping[str, Any], places: Any) -> str:
+    region_key = _normalize_region_key(payload.get("region_key") or payload.get("region"))
+    if region_key:
+        return region_key
+    if isinstance(places, list):
+        for item in places:
+            if isinstance(item, Mapping):
+                region_key = _normalize_region_key(_place_region_label(item))
+                if region_key:
+                    return region_key
+    return ""
+
+
 def _extract_place_keys_from_wp_posts(posts: Any) -> set[str]:
     if not isinstance(posts, list):
         return set()
@@ -678,11 +964,15 @@ def _extract_place_keys_from_wp_posts(posts: Any) -> set[str]:
 
 
 def _extract_place_keys_from_wp_content(content: Any) -> set[str]:
+    return set(_extract_place_key_sequence_from_wp_content(content))
+
+
+def _extract_place_key_sequence_from_wp_content(content: Any) -> list[str]:
     if not content:
-        return set()
+        return []
     normalized = html.unescape(str(content))
-    matches = re.findall(r"query_place_id=([^&\"'\\s<]+)", normalized)
-    return {match.strip() for match in matches if match.strip()}
+    matches = re.findall(r"query_place_id=([^&\"'<\s]+)", normalized)
+    return list(dict.fromkeys([match.strip() for match in matches if match.strip()]))
 
 
 def _filter_places_by_excluded_keys(items: list[dict[str, Any]], excluded_keys: set[str]) -> list[dict[str, Any]]:
@@ -726,6 +1016,87 @@ def _place_keys(item: Mapping[str, Any]) -> set[str]:
         if normalized:
             keys.add(normalized)
     return keys
+
+
+def _place_region_label(item: Mapping[str, Any]) -> str:
+    raw_payload = item.get("raw_payload") or {}
+    if not isinstance(raw_payload, Mapping):
+        raw_payload = {}
+
+    candidates = [
+        item.get("city"),
+        item.get("region"),
+        item.get("locality"),
+        item.get("state"),
+        raw_payload.get("locality"),
+        raw_payload.get("city"),
+        raw_payload.get("region"),
+        raw_payload.get("state"),
+        _address_locality(item.get("address")),
+        item.get("country"),
+        raw_payload.get("country"),
+    ]
+    for value in candidates:
+        cleaned = _clean_region_text(value)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _address_locality(address: Any) -> str:
+    text = to_plain_text(address)
+    if not text:
+        return ""
+
+    parts = [part.strip() for part in text.split(",") if part and part.strip()]
+    middle_parts = parts[1:-1] if len(parts) > 2 else parts
+    for pool in (middle_parts, parts):
+        for part in pool:
+            cleaned = _clean_region_text(part)
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def _clean_region_text(value: Any) -> str:
+    text = to_plain_text(value)
+    if not text:
+        return ""
+    text = re.sub(r"〒\s*\d{3}-\d{4}", " ", text)
+    text = re.sub(r"\b\d{3}-\d{4}\b", " ", text)
+    text = re.sub(r"\b\d+[A-Za-z\-]*\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" ,")
+    lowered = text.lower()
+    if lowered in {"japan", "jp", "일본"}:
+        return ""
+    return text
+
+
+def _normalize_region_key(value: Any) -> str:
+    text = _clean_region_text(value)
+    if not text:
+        return ""
+    text = re.sub(r"[^0-9a-zA-Z가-힣一-龥ぁ-ゔァ-ヴー々〆〤]+", " ", text.lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _title_tokens(title: Any, slug: str = "") -> set[str]:
+    title_text = to_plain_text(title)
+    slug_text = to_plain_text(unquote(slug).replace("-", " "))
+    combined = f"{title_text} {slug_text}".strip().lower()
+    if not combined:
+        return set()
+    return {
+        token
+        for token in re.findall(r"[0-9a-zA-Z가-힣一-龥ぁ-ゔァ-ヴー々〆〤]+", combined)
+        if len(token) > 1 or token.isdigit()
+    }
+
+
+def _token_overlap(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left.intersection(right)) / max(1, min(len(left), len(right)))
 
 
 def _force_collect_fresh_places(ctx: PipelineContext, scenario: str) -> Dict[str, Any]:
@@ -881,11 +1252,17 @@ def refresh_job(context: PipelineContext | None = None) -> Dict[str, Any]:
 
 def _normalize_place(raw: Mapping[str, Any]) -> Dict[str, Any]:
     payload = dict(raw)
+    raw_payload = payload.get("raw_payload") or {}
+    if not isinstance(raw_payload, Mapping):
+        raw_payload = {}
     payload.setdefault("id", payload.get("place_id") or payload.get("placeId") or payload.get("id"))
     payload.setdefault("rating", _to_float(payload.get("rating", 0.0)))
     payload.setdefault("review_count", _to_int(payload.get("user_ratings_total", payload.get("review_count", 0))))
     payload.setdefault("name", payload.get("name", ""))
-    payload.setdefault("city", payload.get("city", payload.get("address", "")))
+    payload.setdefault("city", payload.get("city") or payload.get("region") or raw_payload.get("city") or raw_payload.get("locality") or "")
+    payload.setdefault("region", payload.get("region") or raw_payload.get("region") or raw_payload.get("state") or "")
+    payload.setdefault("locality", payload.get("locality") or raw_payload.get("locality") or raw_payload.get("city") or "")
+    payload.setdefault("state", payload.get("state") or raw_payload.get("state") or raw_payload.get("region") or "")
     payload.setdefault("country", payload.get("country", ""))
     payload.setdefault("business_status", payload.get("business_status", "unknown"))
     payload.setdefault("image_urls", _collect_image_urls(payload))

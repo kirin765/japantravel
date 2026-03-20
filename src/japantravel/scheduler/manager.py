@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import time
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -29,6 +30,7 @@ class SchedulerManager:
             content_cycle_job,
             "interval",
             hours=max(1, self.settings.scheduler_content_interval_hours),
+            next_run_time=datetime.now(tz=self.scheduler.timezone),
             kwargs={"context": self.context},
         )
         # Refresh signal pass for already published posts

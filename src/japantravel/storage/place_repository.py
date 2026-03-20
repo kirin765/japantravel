@@ -8,7 +8,7 @@ import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 from decimal import Decimal
 
 try:
@@ -276,6 +276,61 @@ class PlaceRepository:
                 self._add_place_keys_from_mapping(keys, snapshot)
 
         return keys
+
+    def fetch_place_summaries_by_keys(self, keys: Iterable[str]) -> list[dict[str, Any]]:
+        normalized_keys = [str(value).strip() for value in keys if str(value).strip()]
+        if not self.enabled or not normalized_keys:
+            return []
+
+        sql = """
+            SELECT
+                id,
+                external_place_id,
+                google_place_id,
+                name,
+                region,
+                country,
+                address
+            FROM place
+            WHERE external_place_id = ANY(%s)
+               OR google_place_id = ANY(%s)
+            ORDER BY updated_at DESC NULLS LAST, created_at DESC
+        """
+
+        with connect(self.db_url) as connection:
+            connection.row_factory = dict_row
+            with connection.cursor() as cursor:
+                cursor.execute(sql, (normalized_keys, normalized_keys))
+                rows = cursor.fetchall()
+
+        return [dict(row) for row in rows]
+
+    def update_published_article_status(
+        self,
+        *,
+        wp_post_id: int,
+        status: str,
+        published_at: Optional[datetime] = None,
+    ) -> bool:
+        if not self.enabled or wp_post_id <= 0:
+            return False
+
+        with connect(self.db_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE published_article
+                    SET
+                        status = %s,
+                        published_at = %s,
+                        updated_at = NOW()
+                    WHERE wp_post_id = %s
+                    """,
+                    (status, published_at, wp_post_id),
+                )
+                updated = cursor.rowcount > 0
+            connection.commit()
+        return updated
 
     def save_published_article(
         self,

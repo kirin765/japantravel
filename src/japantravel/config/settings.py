@@ -60,6 +60,7 @@ class Settings:
     top_n_candidates: int = int(os.getenv("TOP_N_CANDIDATES", "30"))
     rank_threshold: float = float(os.getenv("RANK_THRESHOLD", "0.65"))
     recent_published_exclude_count: int = int(os.getenv("RECENT_PUBLISHED_EXCLUDE_COUNT", "5"))
+    recent_title_token_threshold: float = float(os.getenv("RECENT_TITLE_TOKEN_THRESHOLD", "0.6"))
     recent_place_target_count: int = int(os.getenv("RECENT_PLACE_TARGET_COUNT", "6"))
     recent_place_min_count: int = int(os.getenv("RECENT_PLACE_MIN_COUNT", "2"))
     recent_place_force_apify_on_exhaust: bool = os.getenv("RECENT_PLACE_FORCE_APIFY_ON_EXHAUST", "true").lower() == "true"
