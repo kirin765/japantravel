@@ -17,6 +17,12 @@ from ..config.settings import Settings
 from ..modules.generation.formatter import build_post_featured_media_alt_text, build_post_meta_description
 from ..modules.generation.topic_planner import TopicPlan, select_topic_plan
 from ..modules.generation.seo import to_plain_text
+from ..modules.trend_queries import (
+    TrendQueryProvider,
+    build_region_trend_query_plan,
+    build_trend_query_providers,
+    parse_core_region_targets,
+)
 from ..storage import PlaceRepository
 from ..modules.generation import GenerationPipeline
 from ..modules.refresh import RefreshPipeline
@@ -296,6 +302,163 @@ def collect_job(context: PipelineContext | None = None) -> Dict[str, Any]:
                 "run_result": run_result,
             }
         return {"job": "collect", "status": "error", "error": str(exc), "run_result": run_result}
+
+
+def trend_collect_job(context: PipelineContext | None = None) -> Dict[str, Any]:
+    """Collect additional place candidates from Korean travel-intent queries every 48h."""
+    ctx = _ensure_context(context)
+    logger.info("trend_collect_job started")
+
+    if ctx.apify is None or not ctx.settings.apify_actor_id:
+        return {"job": "trend_collect", "status": "skipped", "error": "Apify client is not configured"}
+    if ctx.place_repo is None:
+        return {"job": "trend_collect", "status": "error", "error": "Place repository is not configured (DB_URL missing)"}
+
+    targets = parse_core_region_targets(ctx.settings.trend_core_regions)
+    if not targets:
+        return {"job": "trend_collect", "status": "skipped", "error": "No trend core regions configured"}
+
+    providers = _build_trend_query_provider_chain(ctx.settings)
+    results: list[dict[str, Any]] = []
+    success_count = 0
+    error_count = 0
+
+    for target in targets:
+        plan = build_region_trend_query_plan(
+            target,
+            providers=providers,
+            limit=max(1, ctx.settings.trend_region_query_limit),
+        )
+
+        if not plan.queries:
+            error_count += 1
+            result = {
+                "region": target.display_name,
+                "location_query": target.location_query,
+                "status": "error",
+                "query_count": 0,
+                "queries": [],
+                "providers_attempted": plan.providers_attempted,
+                "providers_used": plan.providers_used,
+                "errors": plan.errors or ["no_queries_generated"],
+            }
+            logger.warning(
+                "trend_collect_job region=%s failed to produce queries providers=%s errors=%s",
+                target.display_name,
+                plan.providers_attempted,
+                result["errors"],
+            )
+            results.append(result)
+            continue
+
+        payload = _build_apify_input(
+            ctx.settings,
+            location_query=target.location_query,
+            search_strings=plan.queries,
+            max_crawled_per_search=ctx.settings.trend_max_crawled_per_search,
+        )
+        run_result: Dict[str, Any] = {}
+        try:
+            settled = _run_apify_with_fallback(ctx.apify, ctx.settings.apify_actor_id, payload)
+            if not settled.get("succeeded", False):
+                error_count += 1
+                result = {
+                    "region": target.display_name,
+                    "location_query": target.location_query,
+                    "status": "error",
+                    "query_count": len(plan.queries),
+                    "queries": plan.queries,
+                    "providers_attempted": plan.providers_attempted,
+                    "providers_used": plan.providers_used,
+                    "errors": plan.errors + [str(settled.get("error", "Apify run did not succeed."))],
+                    "run_result": settled.get("run", {}),
+                }
+                logger.warning(
+                    "trend_collect_job region=%s apify failed error=%s",
+                    target.display_name,
+                    settled.get("error", "Apify run did not succeed."),
+                )
+                results.append(result)
+                continue
+
+            run_result = settled.get("run", {})
+            run_id = run_result.get("id")
+            if not run_id:
+                raise ExternalServiceError("Apify run id not returned")
+
+            raw_items = _apify_payload(ctx.apify.get_run_items(run_id))
+            items = raw_items.get("items", []) if isinstance(raw_items, Mapping) else raw_items
+            if not isinstance(items, list):
+                raise ExternalServiceError("Unexpected Apify items format")
+
+            upsert = ctx.place_repo.upsert_places(
+                items,
+                source="apify",
+                actor_id=ctx.settings.apify_actor_id,
+                dataset_id=_run_dataset_id(run_result),
+                conflict_mode="update",
+            )
+            region_status = "ok" if items else "empty"
+            success_count += 1
+            result = {
+                "region": target.display_name,
+                "location_query": target.location_query,
+                "status": region_status,
+                "query_count": len(plan.queries),
+                "queries": plan.queries,
+                "providers_attempted": plan.providers_attempted,
+                "providers_used": plan.providers_used,
+                "errors": plan.errors,
+                "run_result": run_result,
+                "upsert": {
+                    "fetched_count": upsert.fetched_count,
+                    "inserted_count": upsert.inserted_count,
+                    "reused_count": upsert.reused_count,
+                    "skipped_count": upsert.skipped_count,
+                    "errors": upsert.errors,
+                },
+            }
+            logger.info(
+                "trend_collect_job region=%s queries=%s providers=%s inserted=%s skipped=%s dataset=%s",
+                target.display_name,
+                len(plan.queries),
+                ",".join(plan.providers_used or plan.providers_attempted),
+                upsert.inserted_count,
+                upsert.skipped_count,
+                _run_dataset_id(run_result),
+            )
+            results.append(result)
+        except Exception as exc:
+            error_count += 1
+            logger.warning("trend_collect_job failed region=%s error=%s", target.display_name, exc)
+            results.append(
+                {
+                    "region": target.display_name,
+                    "location_query": target.location_query,
+                    "status": "error",
+                    "query_count": len(plan.queries),
+                    "queries": plan.queries,
+                    "providers_attempted": plan.providers_attempted,
+                    "providers_used": plan.providers_used,
+                    "errors": plan.errors + [str(exc)],
+                    "run_result": run_result,
+                }
+            )
+
+    status = "ok"
+    if error_count and success_count:
+        status = "partial"
+    elif error_count and not success_count:
+        status = "error"
+
+    return {
+        "job": "trend_collect",
+        "status": status,
+        "regions_processed": len(targets),
+        "success_count": success_count,
+        "error_count": error_count,
+        "results": results,
+    }
 
 
 def collect_from_apify_dataset(
@@ -1844,25 +2007,45 @@ def _resolve_dataset_ids(raw_value: Any) -> List[str]:
     return [item.strip() for item in text.splitlines() if item.strip()]
 
 
-def _build_apify_input(settings: Settings) -> Dict[str, Any]:
-    search_strings = [s.strip() for s in (settings.apify_search_strings or "").split(",") if s.strip()]
+def _build_trend_query_provider_chain(settings: Settings) -> list[TrendQueryProvider]:
+    seed_keywords = [item.strip() for item in (settings.trend_seed_keywords or "").split(",") if item.strip()]
+    return build_trend_query_providers(
+        trend_source=settings.trend_source,
+        seed_keywords=seed_keywords,
+        timeframe=settings.trend_google_timeframe,
+    )
+
+
+def _build_apify_input(
+    settings: Settings,
+    *,
+    location_query: str | None = None,
+    search_strings: List[str] | None = None,
+    max_crawled_per_search: int | None = None,
+) -> Dict[str, Any]:
+    resolved_search_strings = list(search_strings or [])
+    if not resolved_search_strings:
+        resolved_search_strings = [s.strip() for s in (settings.apify_search_strings or "").split(",") if s.strip()]
+    search_strings = resolved_search_strings
     if not search_strings:
         search_strings = ["popular attractions"]
 
     default_search = search_strings[0]
+    crawl_limit = max_crawled_per_search or settings.apify_max_crawled_per_search
     payload: Dict[str, Any] = {
         "searchString": default_search,
         "searchStringsArray": search_strings,
-        "maxCrawledPlacesPerSearch": settings.apify_max_crawled_per_search,
-        "maxCrawledPlaces": settings.apify_max_crawled_per_search,
+        "maxCrawledPlacesPerSearch": crawl_limit,
+        "maxCrawledPlaces": crawl_limit,
         "language": settings.apify_language,
         "proxyConfig": {
             "useApifyProxy": True,
         },
     }
 
-    if settings.apify_location_query:
-        payload["locationQuery"] = settings.apify_location_query
+    resolved_location_query = location_query if location_query is not None else settings.apify_location_query
+    if resolved_location_query:
+        payload["locationQuery"] = resolved_location_query
 
     return payload
 

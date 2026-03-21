@@ -34,6 +34,18 @@ class Settings:
     apify_location_query: str = os.getenv("APIFY_LOCATION_QUERY", "")
     apify_language: str = os.getenv("APIFY_LANGUAGE", os.getenv("GOOGLE_PLACES_LANGUAGE", "en"))
     apify_max_crawled_per_search: int = int(os.getenv("APIFY_MAX_CRAWLED_PER_SEARCH", os.getenv("DISCOVERY_SYNC_MAX_RESULTS", "120")))
+    trend_source: str = os.getenv("TREND_SOURCE", "google_then_curated")
+    trend_core_regions: str = os.getenv(
+        "TREND_CORE_REGIONS",
+        "Tokyo,Japan|Osaka,Japan|Kyoto,Japan|Fukuoka,Japan|Okinawa,Japan|Hokkaido,Japan",
+    )
+    trend_seed_keywords: str = os.getenv(
+        "TREND_SEED_KEYWORDS",
+        "맛집,카페,온천,야경,전망대,벚꽃,단풍,쇼핑,시장,박물관,미술관,가족여행,혼자여행,비오는날,료칸,라멘",
+    )
+    trend_region_query_limit: int = int(os.getenv("TREND_REGION_QUERY_LIMIT", "6"))
+    trend_google_timeframe: str = os.getenv("TREND_GOOGLE_TIMEFRAME", "now 7-d")
+    trend_max_crawled_per_search: int = int(os.getenv("TREND_MAX_CRAWLED_PER_SEARCH", "30"))
 
     google_places_api_key: Optional[str] = os.getenv("GOOGLE_PLACES_API_KEY")
     google_places_language: str = os.getenv("GOOGLE_PLACES_LANGUAGE", "en")
@@ -70,4 +82,6 @@ class Settings:
     scheduler_store_url: Optional[str] = os.getenv("SCHEDULER_STORE_URL")
     scheduler_max_instances: int = int(os.getenv("SCHEDULER_MAX_INSTANCES", "1"))
     scheduler_enable_apify_collect: bool = os.getenv("SCHEDULER_ENABLE_APIFY_COLLECT", "false").lower() == "true"
+    scheduler_enable_trend_collect: bool = os.getenv("SCHEDULER_ENABLE_TREND_COLLECT", "true").lower() == "true"
+    scheduler_trend_collect_interval_hours: int = int(os.getenv("SCHEDULER_TREND_COLLECT_INTERVAL_HOURS", "48"))
     scheduler_content_interval_hours: int = int(os.getenv("SCHEDULER_CONTENT_INTERVAL_HOURS", "8"))
