@@ -14,9 +14,11 @@ from .seo import (
     build_image_alt_text,
     build_meta_description,
     build_primary_keyword,
+    infer_content_category,
     normalize_generated_text,
     to_plain_text,
 )
+from ..seo_automation.structured_data import build_structured_data_json
 
 ARTICLE_STYLE = (
     "max-width:820px;margin:0 auto;color:#1f2937;font-size:17px;line-height:1.85;"
@@ -39,6 +41,7 @@ CARD_STYLE = (
 PLACE_CARD_STYLE = CARD_STYLE + "white-space:normal;"
 SUBTITLE_STYLE = "margin:0 0 14px;color:#0f172a;font-size:1.2rem;line-height:1.5;"
 BODY_P_STYLE = "margin:0 0 14px;color:#334155;font-size:1rem;line-height:1.9;"
+INTRO_P_STYLE = "margin:0 0 28px;color:#0f172a;font-size:1.05rem;line-height:1.95;font-weight:500;"
 EMPHASIS_LABEL_STYLE = "color:#0f766e;font-weight:700;"
 CHECKLIST_STYLE = "margin:0;padding:0 0 0 20px;color:#334155;"
 CHECKLIST_ITEM_STYLE = "margin:0 0 12px;line-height:1.85;"
@@ -70,6 +73,7 @@ RELATED_LINK_BOX_STYLE = (
 )
 RELATED_LIST_STYLE = "margin:0;padding:0 0 0 18px;color:#334155;"
 RELATED_LINK_STYLE = "color:#0f766e;text-decoration:none;font-weight:700;"
+GROUP_LABEL_STYLE = "margin:0 0 10px;color:#0f172a;font-weight:800;"
 
 
 def format_markdown(article: GeneratedArticle) -> str:
@@ -168,23 +172,23 @@ def format_wordpress_html_payload(payload: Mapping[str, Any], include_map_iframe
     intro = normalize_generated_text(payload.get("intro", ""), drop_heading_lines=True)
     route_suggestion = normalize_generated_text(payload.get("route_suggestion", ""), drop_heading_lines=True)
     conclusion = normalize_generated_text(payload.get("conclusion", ""), drop_heading_lines=True)
-    related_posts = _coerce_related_posts(payload.get("related_posts", []))
+    internal_links = _coerce_internal_link_groups(payload.get("internal_links") or payload.get("related_posts", []))
+    flat_related_posts = _flatten_internal_link_groups(internal_links)
 
     parts: List[str] = [f'<div class="jt-article" style="{ARTICLE_STYLE}">']
 
-    if summary:
-        parts.append(_render_summary_section(f"{primary_keyword} 한눈에 보기", summary))
-
     if intro:
-        parts.append(_render_section(f"{primary_keyword} 여행 개요", intro))
+        parts.append(f'<p class="jt-intro" style="{INTRO_P_STYLE}">{_format_inline(intro)}</p>')
 
-    if related_posts:
-        parts.append(_render_inline_links(related_posts, primary_keyword))
+    if flat_related_posts:
+        parts.append(_render_inline_links(flat_related_posts, primary_keyword))
+
+    parts.append(_render_basic_info_section(payload, primary_keyword, summary))
 
     place_sections = payload.get("place_sections", [])
     if isinstance(place_sections, list) and place_sections:
         parts.append(f'<section style="{SECTION_STYLE}">')
-        parts.append(f'<h2 style="{SECTION_TITLE_STYLE}">{_format_inline(f"{primary_keyword} 추천 장소")}</h2>')
+        parts.append(f'<h2 style="{SECTION_TITLE_STYLE}">특징 및 추천 이유</h2>')
         for section in place_sections:
             if isinstance(section, Mapping):
                 rendered = _render_place_section(
@@ -197,27 +201,14 @@ def format_wordpress_html_payload(payload: Mapping[str, Any], include_map_iframe
                     parts.append(rendered)
         parts.append("</section>")
 
-    if route_suggestion:
-        parts.append(_render_route_section(f"{primary_keyword} 동선 제안", route_suggestion))
-
     checklist = payload.get("checklist", [])
-    if isinstance(checklist, list) and checklist:
-        parts.append(f'<section style="{SECTION_STYLE}">')
-        parts.append(f'<h2 style="{SECTION_TITLE_STYLE}">{_format_inline(f"{primary_keyword} 체크리스트")}</h2>')
-        parts.append(f'<div style="{CARD_STYLE}">')
-        parts.append(f'<ul style="{CHECKLIST_STYLE}">')
-        for item in checklist:
-            cleaned = normalize_generated_text(item, drop_heading_lines=True)
-            if cleaned:
-                parts.append(f'<li style="{CHECKLIST_ITEM_STYLE}">{_format_inline(cleaned)}</li>')
-        parts.append("</ul>")
-        parts.append("</div>")
-        parts.append("</section>")
+    if route_suggestion or (isinstance(checklist, list) and checklist):
+        parts.append(_render_visit_tips_section(route_suggestion, checklist))
 
     faq_items = payload.get("faq", [])
     if isinstance(faq_items, list) and faq_items:
         parts.append(f'<section style="{SECTION_STYLE}">')
-        parts.append(f'<h2 style="{SECTION_TITLE_STYLE}">{_format_inline(f"{primary_keyword} FAQ")}</h2>')
+        parts.append(f'<h2 style="{SECTION_TITLE_STYLE}">FAQ</h2>')
         parts.append(f'<div style="{FAQ_WRAPPER_STYLE}">')
         for item in faq_items:
             block = _build_faq_html(item)
@@ -226,13 +217,13 @@ def format_wordpress_html_payload(payload: Mapping[str, Any], include_map_iframe
         parts.append("</div>")
         parts.append("</section>")
 
-    if related_posts:
-        parts.append(_render_related_posts_section(related_posts, primary_keyword))
+    parts.append(_render_nearby_places_section(internal_links, primary_keyword))
 
     if conclusion:
-        parts.append(_render_section(f"{primary_keyword} 마무리", conclusion))
+        parts.append(_render_section("결론", conclusion))
 
     parts.append(f'<div style="{NOTICE_STYLE}">※ 모든 운영시간, 혼잡도, 가격 정보는 방문 직전에 다시 확인하세요.</div>')
+    parts.append(f'<script type="application/ld+json">{build_structured_data_json(payload)}</script>')
     parts.append("</div>")
     return "\n".join(part for part in parts if part)
 
@@ -314,7 +305,7 @@ def restyle_existing_wordpress_html(
             intro_target.insert_after(BeautifulSoup(_render_inline_links(related, primary), "html.parser"))
         else:
             root.insert(0, BeautifulSoup(_render_inline_links(related, primary), "html.parser"))
-        root.append(BeautifulSoup(_render_related_posts_section(related, primary), "html.parser"))
+        root.append(BeautifulSoup(_render_nearby_places_section({"same_region": related, "same_category": []}, primary), "html.parser"))
 
     if not root.find(string=lambda text: isinstance(text, str) and "운영시간" in text):
         root.append(BeautifulSoup(f'<div style="{NOTICE_STYLE}">※ 모든 운영시간, 혼잡도, 가격 정보는 방문 직전에 다시 확인하세요.</div>', "html.parser"))
@@ -364,6 +355,39 @@ def _render_summary_section(title: str, text: str) -> str:
     )
 
 
+def _render_basic_info_section(payload: Mapping[str, Any], primary_keyword: str, summary: str) -> str:
+    seo = payload.get("seo") if isinstance(payload.get("seo"), Mapping) else {}
+    region = to_plain_text(payload.get("region"))
+    content_category = to_plain_text(seo.get("content_category")) or infer_content_category(
+        [section.get("category") for section in payload.get("place_sections", []) if isinstance(section, Mapping)]
+    )
+    places = _extract_place_names(payload)
+
+    info_items: list[str] = []
+    if region:
+        info_items.append(f"지역: {region}")
+    if content_category:
+        info_items.append(f"유형: {content_category}")
+    if places:
+        info_items.append(f"대표 장소: {', '.join(places[:3])}")
+    info_items.append(f"핵심 키워드: {primary_keyword}")
+
+    parts = [
+        f'<section style="{SECTION_STYLE}">',
+        f'<h2 style="{SECTION_TITLE_STYLE}">위치 및 기본정보</h2>',
+        f'<div style="{LEAD_BOX_STYLE}">',
+    ]
+    if summary:
+        parts.append(_render_paragraphs(summary, compact=False, in_box=True))
+    parts.append(f'<ul style="{CHECKLIST_STYLE}">')
+    for item in info_items:
+        parts.append(f'<li style="{CHECKLIST_ITEM_STYLE}">{_format_inline(item)}</li>')
+    parts.append("</ul>")
+    parts.append("</div>")
+    parts.append("</section>")
+    return "\n".join(parts)
+
+
 def _render_section(title: str, text: str, box_style: str = CARD_STYLE) -> str:
     cleaned = normalize_generated_text(text, drop_heading_lines=True)
     if not cleaned:
@@ -390,6 +414,36 @@ def _render_route_section(title: str, text: str) -> str:
         parts.append(f'<h3 style="{SUBTITLE_STYLE}">{_format_inline(section_title)}</h3>')
         parts.append(_render_paragraphs(body, compact=False, in_box=True))
     parts.append("</div>")
+    parts.append("</section>")
+    return "\n".join(parts)
+
+
+def _render_visit_tips_section(route_suggestion: str, checklist: Any) -> str:
+    parts: List[str] = [
+        f'<section style="{SECTION_STYLE}">',
+        f'<h2 style="{SECTION_TITLE_STYLE}">방문 팁</h2>',
+    ]
+    if route_suggestion:
+        parts.append(f'<div style="{ROUTE_BOX_STYLE}">')
+        sections = _parse_route_sections(route_suggestion)
+        if sections:
+            for title, body in sections:
+                parts.append(f'<h3 style="{SUBTITLE_STYLE}">{_format_inline(title)}</h3>')
+                parts.append(_render_paragraphs(body, compact=False, in_box=True))
+        else:
+            parts.append(_render_paragraphs(route_suggestion, compact=False, in_box=True))
+        parts.append("</div>")
+
+    if isinstance(checklist, list) and checklist:
+        parts.append(f'<div style="{CARD_STYLE}">')
+        parts.append(f'<ul style="{CHECKLIST_STYLE}">')
+        for item in checklist:
+            cleaned = normalize_generated_text(item, drop_heading_lines=True)
+            if cleaned:
+                parts.append(f'<li style="{CHECKLIST_ITEM_STYLE}">{_format_inline(cleaned)}</li>')
+        parts.append("</ul>")
+        parts.append("</div>")
+
     parts.append("</section>")
     return "\n".join(parts)
 
@@ -461,6 +515,43 @@ def _render_inline_links(related_posts: Sequence[Mapping[str, str]], primary_key
         "</div>"
         "</section>"
     )
+
+
+def _render_nearby_places_section(internal_links: Mapping[str, Sequence[Mapping[str, str]]], primary_keyword: str) -> str:
+    same_region = _coerce_related_posts(list(internal_links.get("same_region", []))) if isinstance(internal_links, Mapping) else []
+    same_category = _coerce_related_posts(list(internal_links.get("same_category", []))) if isinstance(internal_links, Mapping) else []
+    if not same_region and not same_category:
+        same_region = _coerce_related_posts(list(internal_links)) if isinstance(internal_links, list) else []
+
+    if not same_region and not same_category:
+        return ""
+
+    parts: list[str] = [
+        f'<section class="jt-related-posts" style="{SECTION_STYLE}">',
+        f'<h2 style="{SECTION_TITLE_STYLE}">주변 추천 장소</h2>',
+        f'<div style="{CARD_STYLE}">',
+    ]
+    if same_region:
+        parts.append(f'<p style="{GROUP_LABEL_STYLE}">{_format_inline(primary_keyword)}와 같은 지역 글</p>')
+        parts.append(f'<ul style="{RELATED_LIST_STYLE}">')
+        for post in same_region[:5]:
+            parts.append(
+                f'<li style="{CHECKLIST_ITEM_STYLE}"><a href="{html.escape(post["url"], quote=True)}" '
+                f'style="{RELATED_LINK_STYLE}">{_format_inline(post["title"])}</a></li>'
+            )
+        parts.append("</ul>")
+    if same_category:
+        parts.append(f'<p style="{GROUP_LABEL_STYLE}">{_format_inline(primary_keyword)}와 같은 카테고리 글</p>')
+        parts.append(f'<ul style="{RELATED_LIST_STYLE}">')
+        for post in same_category[:3]:
+            parts.append(
+                f'<li style="{CHECKLIST_ITEM_STYLE}"><a href="{html.escape(post["url"], quote=True)}" '
+                f'style="{RELATED_LINK_STYLE}">{_format_inline(post["title"])}</a></li>'
+            )
+        parts.append("</ul>")
+    parts.append("</div>")
+    parts.append("</section>")
+    return "\n".join(parts)
 
 
 def _render_related_posts_section(related_posts: Sequence[Mapping[str, str]], primary_keyword: str) -> str:
@@ -620,6 +711,34 @@ def _coerce_related_posts(values: Any) -> list[dict[str, str]]:
             continue
         posts.append({"title": title, "url": url, "slug": slug})
     return posts
+
+
+def _coerce_internal_link_groups(values: Any) -> dict[str, list[dict[str, str]]]:
+    if isinstance(values, Mapping):
+        return {
+            "same_region": _coerce_related_posts(values.get("same_region", [])),
+            "same_category": _coerce_related_posts(values.get("same_category", [])),
+        }
+    return {
+        "same_region": _coerce_related_posts(values),
+        "same_category": [],
+    }
+
+
+def _flatten_internal_link_groups(values: Mapping[str, Sequence[Mapping[str, str]]]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    flattened: list[dict[str, str]] = []
+    for key in ("same_region", "same_category"):
+        for post in values.get(key, []):
+            normalized = _coerce_related_posts([post])
+            if not normalized:
+                continue
+            item = normalized[0]
+            if item["slug"] in seen:
+                continue
+            seen.add(item["slug"])
+            flattened.append(item)
+    return flattened
 
 
 def _build_faq_block(item: Any) -> str:

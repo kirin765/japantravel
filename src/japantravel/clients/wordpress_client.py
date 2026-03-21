@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
@@ -12,6 +13,11 @@ from requests.auth import HTTPBasicAuth
 
 from ..config.settings import Settings
 from .base import BaseClient
+
+try:
+    from PIL import Image
+except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
+    Image = None  # type: ignore[assignment]
 
 
 class WordPressClient(BaseClient):
@@ -53,6 +59,15 @@ class WordPressClient(BaseClient):
         payload.update(extra)
         return self.json_request("POST", "/posts", json=payload)
 
+    def create_page(self, title: str, content: str, status: str = "draft", **extra: Any) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "title": title,
+            "content": content,
+            "status": status,
+        }
+        payload.update(extra)
+        return self.json_request("POST", "/pages", json=payload)
+
     def update_post(self, post_id: int, **fields: Any) -> Dict[str, Any]:
         return self.json_request("POST", f"/posts/{post_id}", json=fields)
 
@@ -64,6 +79,9 @@ class WordPressClient(BaseClient):
 
     def list_pages(self, **params: Any) -> list[Dict[str, Any]]:
         return self.json_request("GET", "/pages", params=params)
+
+    def get_page(self, page_id: int, **params: Any) -> Dict[str, Any]:
+        return self.json_request("GET", f"/pages/{page_id}", params=params or None)
 
     def update_page(self, page_id: int, **fields: Any) -> Dict[str, Any]:
         return self.json_request("POST", f"/pages/{page_id}", json=fields)
@@ -89,12 +107,17 @@ class WordPressClient(BaseClient):
         inferred_name = filename or Path(parsed.path).name
         if not inferred_name:
             inferred_name = "media"
+        content_type = response.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
         if "." not in inferred_name:
-            extension = mimetypes.guess_extension(response.headers.get("content-type", "application/octet-stream").split(";")[0].strip())
+            extension = mimetypes.guess_extension(content_type)
             if extension:
                 inferred_name = f"{inferred_name}{extension}"
+        file_bytes = response.content
+        converted = self._convert_to_webp_if_possible(file_bytes, inferred_name, content_type)
+        if converted is not None:
+            file_bytes, inferred_name, content_type = converted
         files = {
-            "file": (inferred_name, response.content, response.headers.get("content-type", "application/octet-stream"))
+            "file": (inferred_name, file_bytes, content_type)
         }
         return self.json_request("POST", "/media", files=files)
 
@@ -123,3 +146,27 @@ class WordPressClient(BaseClient):
         if slug:
             payload["slug"] = slug
         return self.json_request("POST", "/tags", json=payload)
+
+    def _convert_to_webp_if_possible(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        content_type: str,
+    ) -> tuple[bytes, str, str] | None:
+        if Image is None:
+            return None
+        lower_name = filename.lower()
+        if "webp" in content_type or lower_name.endswith(".webp"):
+            return None
+        if not content_type.startswith("image/") and not lower_name.endswith((".jpg", ".jpeg", ".png")):
+            return None
+
+        try:
+            with Image.open(BytesIO(file_bytes)) as image:
+                converted = image.convert("RGB")
+                buffer = BytesIO()
+                converted.save(buffer, format="WEBP", quality=85, method=6)
+                stem = Path(filename).stem or "media"
+                return buffer.getvalue(), f"{stem}.webp", "image/webp"
+        except Exception:  # pragma: no cover - best-effort media optimization
+            return None

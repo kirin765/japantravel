@@ -79,6 +79,7 @@ class PublishPipeline:
         featured_media: Optional[Any] = None,
         excerpt: str = "",
         featured_media_alt_text: str = "",
+        meta_fields: Optional[Mapping[str, Any]] = None,
         dry_run: bool = False,
         **extra_fields: Any,
     ) -> Dict[str, Any]:
@@ -116,6 +117,8 @@ class PublishPipeline:
             payload["tags"] = tag_ids
         if featured_media_id:
             payload["featured_media"] = featured_media_id
+        if meta_fields:
+            payload["meta"] = dict(meta_fields)
 
         payload.update(extra_fields)
 
@@ -146,6 +149,62 @@ class PublishPipeline:
             "term_ids": {"categories": category_ids, "tags": tag_ids},
             "featured_media_id": featured_media_id,
             "featured_media_ids": media_ids,
+            "wp_response": response,
+        }
+
+    def publish_page(
+        self,
+        title: str,
+        content: str,
+        status: str = "draft",
+        slug: Optional[str] = None,
+        excerpt: str = "",
+        parent: Optional[int] = None,
+        meta_fields: Optional[Mapping[str, Any]] = None,
+        dry_run: bool = False,
+        **extra_fields: Any,
+    ) -> Dict[str, Any]:
+        normalized_status = self._normalize_status(status)
+        normalized_title = self._normalize_wp_title(title)
+        final_slug = self._build_slug(slug or normalized_title)
+
+        payload: Dict[str, Any] = {
+            "title": normalized_title,
+            "content": content,
+            "status": normalized_status,
+            "slug": final_slug,
+            "excerpt": excerpt,
+        }
+        if parent:
+            payload["parent"] = parent
+        if meta_fields:
+            payload["meta"] = dict(meta_fields)
+        payload.update(extra_fields)
+
+        if dry_run:
+            return {
+                "requested_status": status,
+                "actual_status": normalized_status,
+                "post_id": None,
+                "post_url": None,
+                "slug": final_slug,
+                "term_ids": {"categories": [], "tags": []},
+                "featured_media_id": None,
+                "featured_media_ids": [],
+                "payload": payload,
+                "message": "Dry-run completed; request not sent.",
+            }
+
+        response = self.wp.create_page(**payload)
+        return {
+            "requested_status": status,
+            "actual_status": response.get("status", normalized_status),
+            "post_id": response.get("id"),
+            "post_url": response.get("link"),
+            "slug": response.get("slug", final_slug),
+            "term_ids": {"categories": [], "tags": []},
+            "featured_media_id": None,
+            "featured_media_ids": [],
             "wp_response": response,
         }
 

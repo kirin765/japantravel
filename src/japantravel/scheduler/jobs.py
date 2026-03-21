@@ -875,17 +875,20 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
                 )
                 continue
 
-            category_names = ["japan", payload.get("region", "asia")]
+            seo = payload.get("seo") if isinstance(payload.get("seo"), Mapping) else {}
+            content_category = to_plain_text(seo.get("content_category")) or "여행지"
+            category_names = ["japan", payload.get("region", "asia"), content_category]
             tag_names = [generated.get("candidate_topic", "travel"), "korean_traveler"]
             term_ids = publisher.resolve_term_ids(categories=category_names, tags=tag_names)
             payload = dict(payload)
-            payload["related_posts"] = _select_related_posts(
+            internal_links = _select_internal_links(
                 ctx.wp,
-                category_ids=term_ids["categories"],
-                tag_ids=term_ids["tags"],
+                region_category_id=term_ids["categories"][1] if len(term_ids["categories"]) > 1 else None,
+                content_category_id=term_ids["categories"][2] if len(term_ids["categories"]) > 2 else None,
                 exclude_title=title,
-                limit=3,
             )
+            payload["internal_links"] = internal_links
+            payload["related_posts"] = internal_links.get("same_region", []) + internal_links.get("same_category", [])
             content_html = _format_article_content(payload)
             featured_media_urls = _collect_featured_images(generated.get("places", []), payload)
             excerpt = build_post_meta_description(payload)
@@ -899,6 +902,7 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
                 featured_media_alt_text=featured_media_alt_text,
                 categories=term_ids["categories"],
                 tags=term_ids["tags"],
+                meta_fields=_build_wp_meta_fields(payload, ctx.settings),
                 dry_run=False,
             )
             sitemap_verification: Dict[str, Any] = {}
@@ -1786,6 +1790,63 @@ def _select_related_posts(
                 return selected
 
     return selected
+
+
+def _select_internal_links(
+    wp: WordPressClient,
+    *,
+    region_category_id: int | None = None,
+    content_category_id: int | None = None,
+    exclude_title: str = "",
+) -> dict[str, list[dict[str, str]]]:
+    same_region = _select_related_posts(
+        wp,
+        category_ids=[region_category_id] if region_category_id else [],
+        tag_ids=[],
+        exclude_title=exclude_title,
+        limit=5,
+    )
+    seen = {item["slug"] for item in same_region}
+    same_category = []
+    for item in _select_related_posts(
+        wp,
+        category_ids=[content_category_id] if content_category_id else [],
+        tag_ids=[],
+        exclude_title=exclude_title,
+        limit=6,
+    ):
+        if item["slug"] in seen:
+            continue
+        seen.add(item["slug"])
+        same_category.append(item)
+        if len(same_category) >= 3:
+            break
+    return {"same_region": same_region[:5], "same_category": same_category[:3]}
+
+
+def _build_wp_meta_fields(payload: Mapping[str, Any], settings: Settings) -> dict[str, Any]:
+    seo = payload.get("seo")
+    if not isinstance(seo, Mapping):
+        return {}
+
+    meta_fields: dict[str, Any] = {}
+    if settings.wordpress_meta_title_key:
+        title_tag = to_plain_text(seo.get("title_tag") or payload.get("title"))
+        if title_tag:
+            meta_fields[settings.wordpress_meta_title_key] = title_tag
+    if settings.wordpress_meta_description_key:
+        description = to_plain_text(seo.get("meta_description"))
+        if description:
+            meta_fields[settings.wordpress_meta_description_key] = description
+    if settings.wordpress_meta_keywords_key:
+        keywords = ", ".join(to_plain_text(item) for item in seo.get("keywords", []) if to_plain_text(item))
+        if keywords:
+            meta_fields[settings.wordpress_meta_keywords_key] = keywords
+    if settings.wordpress_meta_canonical_key:
+        canonical_path = to_plain_text(seo.get("canonical_path"))
+        if canonical_path and settings.wordpress_base_url:
+            meta_fields[settings.wordpress_meta_canonical_key] = f"{settings.wordpress_base_url.rstrip('/')}{canonical_path}"
+    return meta_fields
 
 
 def _normalize_related_post(post: Mapping[str, Any]) -> dict[str, str] | None:

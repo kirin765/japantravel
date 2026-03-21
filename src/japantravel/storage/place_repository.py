@@ -14,9 +14,11 @@ from decimal import Decimal
 try:
     from psycopg import connect
     from psycopg.rows import dict_row
+    from psycopg.types.json import Json
 except ModuleNotFoundError:
     connect = None  # type: ignore[assignment]
     dict_row = None  # type: ignore[assignment]
+    Json = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -402,6 +404,7 @@ class PlaceRepository:
 
         payload = dict(raw_publish_response or {})
         content_hash = hashlib.sha256(f"{slug}\n{content_html}".encode("utf-8")).hexdigest()
+        payload_value = Json(payload) if Json is not None else json.dumps(payload, ensure_ascii=False)
 
         with connect(self.db_url) as connection:
             with connection.cursor() as cursor:
@@ -458,7 +461,7 @@ class PlaceRepository:
                         categories or [],
                         tags or [],
                         content_hash,
-                        payload,
+                        payload_value,
                         created_by,
                     ),
                 )

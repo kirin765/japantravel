@@ -24,9 +24,14 @@ from ...clients.openai_client import OpenAIClient
 from ...shared.exceptions import ExternalServiceError
 from . import prompt_templates as templates
 from .seo import (
+    build_canonical_path,
+    build_keyword_list,
     build_meta_description,
     build_primary_keyword,
     build_secondary_topics,
+    build_title_tag,
+    infer_content_category,
+    infer_schema_type,
     normalize_generated_text,
 )
 
@@ -51,12 +56,22 @@ class SeoMetadata:
     primary_keyword: str
     secondary_topics: List[str]
     meta_description: str
+    title_tag: str
+    keywords: List[str]
+    canonical_path: str
+    schema_type: str
+    content_category: str
 
     def to_payload(self) -> Dict[str, Any]:
         return {
             "primary_keyword": self.primary_keyword,
             "secondary_topics": list(self.secondary_topics),
             "meta_description": self.meta_description,
+            "title_tag": self.title_tag,
+            "keywords": list(self.keywords),
+            "canonical_path": self.canonical_path,
+            "schema_type": self.schema_type,
+            "content_category": self.content_category,
         }
 
 
@@ -151,19 +166,56 @@ class GenerationPipeline:
         checklist = self._generate_checklist(selected=selected, context=draft_context)
         faq = self._generate_faq(selected=selected, context=draft_context)
         conclusion = self._generate_conclusion(selected=selected, context=draft_context)
+        content_category = infer_content_category(
+            [
+                item.get("category")
+                for item in selected
+                if isinstance(item, Mapping)
+            ]
+        )
+        place_names = [section.place_name for section in place_sections]
+        primary_place = place_names[0] if place_names else ""
         seo = SeoMetadata(
             primary_keyword=build_primary_keyword(
                 title=title,
                 region=str(draft_context.get("region", "")),
                 scenario=str(draft_context.get("scenario", self.scenario)),
             ),
-            secondary_topics=build_secondary_topics([section.place_name for section in place_sections]),
+            secondary_topics=build_secondary_topics(place_names),
             meta_description=build_meta_description(
                 title=title,
                 summary=summary,
                 intro=intro,
                 region=str(draft_context.get("region", "")),
             ),
+            title_tag=build_title_tag(
+                region=str(draft_context.get("region", "")),
+                place_name=primary_place,
+            ),
+            keywords=build_keyword_list(
+                primary_keyword=build_primary_keyword(
+                    title=title,
+                    region=str(draft_context.get("region", "")),
+                    scenario=str(draft_context.get("scenario", self.scenario)),
+                ),
+                secondary_topics=build_secondary_topics(place_names),
+                region=str(draft_context.get("region", "")),
+                place_name=primary_place,
+                content_category=content_category,
+            ),
+            canonical_path=build_canonical_path(
+                "japan",
+                str(draft_context.get("region", "")),
+                primary_place or title,
+            ),
+            schema_type=infer_schema_type(
+                [
+                    item.get("category")
+                    for item in selected
+                    if isinstance(item, Mapping)
+                ]
+            ),
+            content_category=content_category,
         )
 
         return GeneratedArticle(

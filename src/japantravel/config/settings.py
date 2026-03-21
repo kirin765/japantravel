@@ -60,6 +60,10 @@ class Settings:
     wordpress_username: Optional[str] = os.getenv("WORDPRESS_USERNAME")
     wordpress_app_password: Optional[str] = os.getenv("WORDPRESS_APP_PASSWORD")
     wordpress_rest_api_version: str = os.getenv("WORDPRESS_REST_API_VERSION", "wp/v2")
+    wordpress_meta_title_key: Optional[str] = os.getenv("WORDPRESS_META_TITLE_KEY")
+    wordpress_meta_description_key: Optional[str] = os.getenv("WORDPRESS_META_DESCRIPTION_KEY")
+    wordpress_meta_keywords_key: Optional[str] = os.getenv("WORDPRESS_META_KEYWORDS_KEY")
+    wordpress_meta_canonical_key: Optional[str] = os.getenv("WORDPRESS_META_CANONICAL_KEY")
 
     db_url: Optional[str] = os.getenv("DB_URL")
     place_cache_ttl_days: int = int(os.getenv("PLACE_CACHE_TTL_DAYS", "30"))
