@@ -1,3 +1,4 @@
+from japantravel.modules.generation.topic_planner import select_topic_plan
 from japantravel.modules.ranking.scorer import RankItem, RankingComponents
 from japantravel.scheduler.jobs import (
     RecentPostSignature,
@@ -89,6 +90,29 @@ def test_find_recent_duplicate_signature_matches_title_similarity_without_region
     assert reason == "recent_title_similarity"
 
 
+def test_find_recent_duplicate_signature_ignores_generic_title_overlap_for_other_regions():
+    recent = [
+        RecentPostSignature(
+            post_id=59,
+            title="아오가시마에서 혼자 떠나는 2일간의 여행 일정 추천",
+            slug="aogashima-solo-trip",
+            title_tokens=_title_tokens("아오가시마에서 혼자 떠나는 2일간의 여행 일정 추천", "aogashima-solo-trip"),
+            region_key=_normalize_region_key("Aogashima"),
+            region_label="Aogashima",
+        )
+    ]
+
+    signature, reason = _find_recent_duplicate_signature(
+        title="Oshima에서 혼자 떠나는 2일간의 힐링 여행 추천 일정",
+        region_key=_normalize_region_key("Oshima"),
+        recent_signatures=recent,
+        threshold=0.6,
+    )
+
+    assert signature is None
+    assert reason == ""
+
+
 def test_infer_recent_post_region_prefers_first_place_key_over_majority():
     place_rows_by_key = {
         "a1": {"region": "Aogashima", "country": "JP"},
@@ -142,3 +166,31 @@ def test_cleanup_duplicate_topics_picks_newest_matching_post_only():
     assert target.post_id == 80
     assert previous.post_id == 75
     assert reason == "recent_region"
+
+
+def test_select_topic_plan_prefers_unused_title_family_and_angle():
+    recent = [
+        RecentPostSignature(
+            post_id=80,
+            title="도쿄 첫 방문자를 위한 하루 가이드",
+            slug="tokyo-first-visit",
+            title_family="core_guide",
+            content_angle_key="first_visit_highlights",
+            audience_key="first_timer",
+            duration_days=1,
+        ),
+        RecentPostSignature(
+            post_id=75,
+            title="오사카 첫 방문 하루 가이드",
+            slug="osaka-first-visit",
+            title_family="core_guide",
+            content_angle_key="first_visit_highlights",
+            audience_key="first_timer",
+            duration_days=1,
+        ),
+    ]
+
+    plan = select_topic_plan(recent_signatures=recent, region_key="oshima", scenario="solo_travel")
+
+    assert plan.title_family != "core_guide"
+    assert plan.content_angle_key != "first_visit_highlights"

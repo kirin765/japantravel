@@ -199,9 +199,15 @@ class GenerationPipeline:
         return context
 
     def _generate_title(self, selected: Sequence[Mapping[str, Any]], context: Mapping[str, Any]) -> str:
+        prompt_values = self._prompt_values(context)
         user_prompt = templates.TITLE_PROMPT.format(
             region=context["region"],
-            scenario=context["scenario"],
+            scenario=prompt_values["scenario"],
+            audience=prompt_values["audience"],
+            duration_days=prompt_values["duration_days"],
+            content_angle=prompt_values["content_angle"],
+            title_family=prompt_values["title_family"],
+            title_hook=prompt_values["title_hook"],
             place_count=len(selected),
             names=self._place_names(selected),
         )
@@ -237,9 +243,12 @@ class GenerationPipeline:
         return title
 
     def _generate_summary(self, selected: Sequence[Mapping[str, Any]], context: Mapping[str, Any]) -> str:
+        prompt_values = self._prompt_values(context)
         user_prompt = templates.SUMMARY_PROMPT.format(
             region=context["region"],
-            scenario=context["scenario"],
+            scenario=prompt_values["scenario"],
+            audience=prompt_values["audience"],
+            content_angle=prompt_values["content_angle"],
             place_count=len(selected),
         )
         raw = self.client.generate(
@@ -250,7 +259,14 @@ class GenerationPipeline:
         return normalize_generated_text(raw, drop_heading_lines=True)
 
     def _generate_intro(self, selected: Sequence[Mapping[str, Any]], context: Mapping[str, Any]) -> str:
-        user_prompt = templates.INTRO_PROMPT.format(region=context["region"], scenario=context["scenario"])
+        prompt_values = self._prompt_values(context)
+        user_prompt = templates.INTRO_PROMPT.format(
+            region=context["region"],
+            scenario=prompt_values["scenario"],
+            audience=prompt_values["audience"],
+            duration_days=prompt_values["duration_days"],
+            content_angle=prompt_values["content_angle"],
+        )
         raw = self.client.generate(
             system_prompt=templates.SYSTEM,
             user_prompt=user_prompt,
@@ -270,9 +286,12 @@ class GenerationPipeline:
             name = str(place.get("name", ""))
             rating = self._to_display_rating(place)
             review_count = self._to_int(place.get("review_count", 0))
+            prompt_values = self._prompt_values(context)
             section_prompt = templates.PLACE_SECTION_PROMPT.format(
                 name=name,
-                scenario=context["scenario"],
+                scenario=prompt_values["scenario"],
+                content_angle=prompt_values["content_angle"],
+                audience=prompt_values["audience"],
             )
             content = self._retry_generate(
                 system_prompt=templates.SYSTEM_PLACE_SECTION,
@@ -334,10 +353,13 @@ class GenerationPipeline:
         selected: Sequence[Mapping[str, Any]],
         context: Mapping[str, Any],
     ) -> str:
+        prompt_values = self._prompt_values(context)
         user_prompt = templates.ROUTE_PROMPT.format(
             region=context["region"],
-            scenario=context["scenario"],
-            duration=context.get("duration_days") or 1,
+            scenario=prompt_values["scenario"],
+            audience=prompt_values["audience"],
+            content_angle=prompt_values["content_angle"],
+            duration=prompt_values["duration_days"],
         )
         raw = self.client.generate(
             system_prompt=templates.SYSTEM,
@@ -351,9 +373,13 @@ class GenerationPipeline:
         selected: Sequence[Mapping[str, Any]],
         context: Mapping[str, Any],
     ) -> List[str]:
+        prompt_values = self._prompt_values(context)
         user_prompt = templates.CHECKLIST_PROMPT.format(
-            scenario=context["scenario"],
+            scenario=prompt_values["scenario"],
             region=context["region"],
+            audience=prompt_values["audience"],
+            duration_days=prompt_values["duration_days"],
+            content_angle=prompt_values["content_angle"],
         )
         raw = self.client.generate(
             system_prompt=templates.SYSTEM,
@@ -370,9 +396,12 @@ class GenerationPipeline:
         selected: Sequence[Mapping[str, Any]],
         context: Mapping[str, Any],
     ) -> List[Dict[str, str]]:
+        prompt_values = self._prompt_values(context)
         user_prompt = templates.FAQ_PROMPT.format(
             region=context["region"],
-            scenario=context["scenario"],
+            scenario=prompt_values["scenario"],
+            audience=prompt_values["audience"],
+            content_angle=prompt_values["content_angle"],
         )
         raw = self.client.generate(
             system_prompt=templates.SYSTEM,
@@ -382,9 +411,12 @@ class GenerationPipeline:
         return self._split_qa(raw)
 
     def _generate_conclusion(self, selected: Sequence[Mapping[str, Any]], context: Mapping[str, Any]) -> str:
+        prompt_values = self._prompt_values(context)
         user_prompt = templates.CONCLUSION_PROMPT.format(
-            scenario=context["scenario"],
+            scenario=prompt_values["scenario"],
             region=context["region"],
+            audience=prompt_values["audience"],
+            content_angle=prompt_values["content_angle"],
         )
         raw = self.client.generate(
             system_prompt=templates.SYSTEM,
@@ -392,6 +424,45 @@ class GenerationPipeline:
             context={"selected_places": selected, **context},
         )
         return normalize_generated_text(raw, drop_heading_lines=True)
+
+    def _prompt_values(self, context: Mapping[str, Any]) -> Dict[str, Any]:
+        scenario = self._scenario_label(context.get("scenario", self.scenario))
+        duration_days = self._to_int(context.get("duration_days", 1)) or 1
+        return {
+            "scenario": scenario,
+            "duration_days": duration_days,
+            "content_angle": self._to_prompt_text(
+                context.get("content_angle_label") or context.get("content_angle"),
+                fallback="지역 대표 포인트 중심",
+            ),
+            "audience": self._to_prompt_text(
+                context.get("audience_label") or context.get("audience"),
+                fallback="한국어 여행 독자",
+            ),
+            "title_family": self._to_prompt_text(
+                context.get("title_family_label") or context.get("title_family"),
+                fallback="정보형 제목",
+            ),
+            "title_hook": self._to_prompt_text(
+                context.get("title_hook"),
+                fallback="현실적인 동선과 포인트",
+            ),
+        }
+
+    @staticmethod
+    def _to_prompt_text(value: Any, fallback: str) -> str:
+        cleaned = normalize_generated_text(value, drop_heading_lines=True)
+        return cleaned or fallback
+
+    @staticmethod
+    def _scenario_label(value: Any) -> str:
+        mapping = {
+            "solo_travel": "혼자 여행",
+            "rainy_day": "비 오는 날 여행",
+            "parents_trip": "부모님과 함께하는 여행",
+        }
+        raw = str(value or "").strip()
+        return mapping.get(raw, raw.replace("_", " ") or "여행")
 
     def _retry_generate(self, system_prompt: str, user_prompt: str, context: Mapping[str, Any]) -> str:
         # Retry only around generation logic where transient model errors may occur

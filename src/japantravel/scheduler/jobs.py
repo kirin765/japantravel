@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from ..clients import ApifyClient, GooglePlacesClient, OpenAIClient, WordPressClient
 from ..config.settings import Settings
 from ..modules.generation.formatter import build_post_featured_media_alt_text, build_post_meta_description
+from ..modules.generation.topic_planner import TopicPlan, select_topic_plan
 from ..modules.generation.seo import to_plain_text
 from ..storage import PlaceRepository
 from ..modules.generation import GenerationPipeline
@@ -76,6 +77,14 @@ class RecentPostSignature:
     place_keys: set[str] = field(default_factory=set)
     region_key: str = ""
     region_label: str = ""
+    plan_key: str = ""
+    title_family: str = ""
+    title_family_label: str = ""
+    content_angle_key: str = ""
+    content_angle_label: str = ""
+    audience_key: str = ""
+    audience_label: str = ""
+    duration_days: int = 0
 
 
 @dataclass
@@ -83,6 +92,66 @@ class RegionCluster:
     region_key: str
     region_label: str
     ranked_items: List["scorer.RankItem"] = field(default_factory=list)
+
+
+TITLE_TOKEN_STOPWORDS = {
+    "trip",
+    "travel",
+    "itinerary",
+    "guide",
+    "plan",
+    "route",
+    "solo",
+    "journey",
+    "여행",
+    "여행지",
+    "일정",
+    "추천",
+    "가이드",
+    "플랜",
+    "동선",
+    "코스",
+    "명소",
+    "정리",
+    "핵심",
+    "가볼만한",
+    "가볼",
+    "좋은",
+    "떠나는",
+    "즐기는",
+    "만끽하는",
+    "혼자",
+    "혼자만의",
+    "하루",
+    "주말",
+    "리스트",
+}
+TITLE_TOKEN_SUFFIXES = (
+    "에서의",
+    "에서",
+    "으로의",
+    "으로",
+    "와의",
+    "와",
+    "과의",
+    "과",
+    "만의",
+    "만",
+    "에는",
+    "에서만",
+    "까지",
+    "부터",
+    "에게",
+    "께",
+    "의",
+    "은",
+    "는",
+    "을",
+    "를",
+    "이",
+    "가",
+    "도",
+)
 
 
 def _init_client(name: str, constructor):
@@ -474,6 +543,11 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
         top = selected_cluster.ranked_items[:target_count]
         top_payloads = [item.payload for item in top]
         region = selected_cluster.region_label or _place_region_label(top_payloads[0]) or "Tokyo"
+        topic_plan = select_topic_plan(
+            recent_signatures=recent_signatures,
+            region_key=selected_cluster.region_key,
+            scenario=scenario,
+        )
 
         if not top_payloads:
             return {"job": "generate", "status": "skipped", "reason": "no ranked candidates"}
@@ -484,6 +558,9 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
                 scenario=scenario,
                 city=region,
                 country=item.payload.get("country", ""),
+                audience=topic_plan.audience_key,
+                content_angle=topic_plan.content_angle_label,
+                duration_days=topic_plan.duration_days,
             )
             for item in top
         ]
@@ -496,9 +573,13 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
             article = generator.generate_article(
                 places=candidate_payload,
                 region=region,
-                duration_days=2,
+                duration_days=topic_plan.duration_days,
                 tone=tone,
-                extra_context={"scenario": scenario, "variant_id": variant_id},
+                extra_context={
+                    "scenario": scenario,
+                    "variant_id": variant_id,
+                    **topic_plan.to_context(),
+                },
             )
             payload = article.to_payload()
             payload["variant_id"] = variant_id
@@ -506,12 +587,23 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
             payload["region"] = region
             payload["region_key"] = selected_cluster.region_key
             payload["scenario"] = scenario
+            payload["topic_plan_key"] = topic_plan.plan_key
+            payload["topic_plan"] = topic_plan.to_payload()
+            payload["title_family"] = topic_plan.title_family
+            payload["title_family_label"] = topic_plan.title_family_label
+            payload["content_angle"] = topic_plan.content_angle_label
+            payload["content_angle_key"] = topic_plan.content_angle_key
+            payload["audience"] = topic_plan.audience_label
+            payload["audience_key"] = topic_plan.audience_key
+            payload["duration_days"] = topic_plan.duration_days
+            payload["title_hook"] = topic_plan.title_hook
             variants.append({"variant_id": variant_id, "payload": payload})
 
         ctx.generated_articles = [
             {
                 "candidate_topic": _topic_key(ctx.article_candidates[0]),
                 "region_key": selected_cluster.region_key,
+                "topic_plan": topic_plan.to_payload(),
                 "variants": variants,
                 "payload": variants[0]["payload"],
                 "places": top_payloads,
@@ -524,6 +616,7 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
             "excluded_place_count": len(excluded_keys),
             "selected_place_count": len(top_payloads),
             "selected_region_key": selected_cluster.region_key,
+            "topic_plan_key": topic_plan.plan_key,
             "refresh": refresh_result or {},
         }
     except Exception as exc:
@@ -597,6 +690,7 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
                 region_key=region_key,
                 recent_signatures=recent_signatures,
                 threshold=ctx.settings.recent_title_token_threshold,
+                topic_metadata=_extract_topic_metadata(payload),
             )
             if duplicate_match is not None:
                 duplicate_skips += 1
@@ -672,6 +766,7 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
                 raw_publish_response["review"] = review
                 raw_publish_response["region_key"] = region_key
                 raw_publish_response["dedupe_title_tokens"] = sorted(_title_tokens(title, result.get("slug", "")))
+                raw_publish_response["topic_plan"] = _extract_topic_metadata(payload)
                 saved = ctx.place_repo.save_published_article(
                     primary_place_id=primary_place_db_id,
                     wp_post_id=int(result.get("post_id") or 0),
@@ -722,6 +817,14 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
                     place_keys=set(_candidate_place_keys(places, payload)),
                     region_key=region_key,
                     region_label=str(payload.get("region", "")),
+                    plan_key=str(payload.get("topic_plan_key") or _extract_topic_metadata(payload).get("plan_key", "")),
+                    title_family=str(payload.get("title_family", "")),
+                    title_family_label=str(payload.get("title_family_label", "")),
+                    content_angle_key=str(payload.get("content_angle_key", "")),
+                    content_angle_label=str(payload.get("content_angle", "")),
+                    audience_key=str(payload.get("audience_key", "")),
+                    audience_label=str(payload.get("audience", "")),
+                    duration_days=_coerce_positive_int(payload.get("duration_days")),
                 )
             )
 
@@ -781,9 +884,13 @@ def _build_recent_post_signatures(
 
     place_rows_by_key: dict[str, Mapping[str, Any]] = {}
     all_keys: set[str] = set()
+    post_ids: list[int] = []
     for post in posts:
         if not isinstance(post, Mapping):
             continue
+        post_id = post.get("id")
+        if isinstance(post_id, int) and post_id > 0:
+            post_ids.append(post_id)
         content = (post.get("content") or {}).get("rendered", "")
         all_keys.update(_extract_place_key_sequence_from_wp_content(content))
 
@@ -799,6 +906,13 @@ def _build_recent_post_signatures(
         except Exception as exc:
             logger.warning("could not resolve recent post place keys to place rows: %s", exc)
 
+    topic_metadata_by_post_id: dict[int, Mapping[str, Any]] = {}
+    if place_repo is not None and post_ids:
+        try:
+            topic_metadata_by_post_id = place_repo.fetch_published_topic_metadata_by_post_ids(post_ids, status="published")
+        except Exception as exc:
+            logger.warning("could not resolve recent post topic metadata from DB: %s", exc)
+
     signatures: list[RecentPostSignature] = []
     for post in posts:
         if not isinstance(post, Mapping):
@@ -813,6 +927,7 @@ def _build_recent_post_signatures(
         place_key_sequence = _extract_place_key_sequence_from_wp_content(content)
         place_keys = set(place_key_sequence)
         region_key, region_label = _infer_recent_post_region(place_key_sequence, title, slug, place_rows_by_key)
+        topic_metadata = _extract_topic_metadata(topic_metadata_by_post_id.get(post_id, {}))
         signatures.append(
             RecentPostSignature(
                 post_id=post_id,
@@ -823,6 +938,14 @@ def _build_recent_post_signatures(
                 place_keys=place_keys,
                 region_key=region_key,
                 region_label=region_label,
+                plan_key=str(topic_metadata.get("plan_key", "")),
+                title_family=str(topic_metadata.get("title_family", "")),
+                title_family_label=str(topic_metadata.get("title_family_label", "")),
+                content_angle_key=str(topic_metadata.get("content_angle_key", "")),
+                content_angle_label=str(topic_metadata.get("content_angle_label", "")),
+                audience_key=str(topic_metadata.get("audience_key", "")),
+                audience_label=str(topic_metadata.get("audience_label", "")),
+                duration_days=_coerce_positive_int(topic_metadata.get("duration_days")),
             )
         )
 
@@ -923,6 +1046,7 @@ def _find_recent_duplicate_signature(
     region_key: str,
     recent_signatures: list[RecentPostSignature],
     threshold: float,
+    topic_metadata: Mapping[str, Any] | None = None,
 ) -> tuple[RecentPostSignature | None, str]:
     normalized_region_key = _normalize_region_key(region_key)
     if normalized_region_key:
@@ -931,8 +1055,16 @@ def _find_recent_duplicate_signature(
                 return signature, "recent_region"
 
     title_tokens = _title_tokens(title)
+    normalized_topic = _extract_topic_metadata(topic_metadata or {})
     for signature in recent_signatures:
-        if title_tokens and signature.title_tokens and _token_overlap(title_tokens, signature.title_tokens) >= threshold:
+        if not title_tokens or not signature.title_tokens:
+            continue
+        overlap = _token_overlap(title_tokens, signature.title_tokens)
+        if overlap < threshold:
+            continue
+        if _topic_signature_matches(normalized_topic, signature):
+            return signature, "recent_topic_signature"
+        if not signature.plan_key and not signature.title_family and not signature.content_angle_key:
             return signature, "recent_title_similarity"
     return None, ""
 
@@ -1086,17 +1218,100 @@ def _title_tokens(title: Any, slug: str = "") -> set[str]:
     combined = f"{title_text} {slug_text}".strip().lower()
     if not combined:
         return set()
-    return {
-        token
-        for token in re.findall(r"[0-9a-zA-Z가-힣一-龥ぁ-ゔァ-ヴー々〆〤]+", combined)
-        if len(token) > 1 or token.isdigit()
-    }
+    normalized_tokens: set[str] = set()
+    for raw in re.findall(r"[0-9a-zA-Z가-힣一-龥ぁ-ゔァ-ヴー々〆〤]+", combined):
+        token = _normalize_title_token(raw)
+        if token:
+            normalized_tokens.add(token)
+    return normalized_tokens
 
 
 def _token_overlap(left: set[str], right: set[str]) -> float:
     if not left or not right:
         return 0.0
     return len(left.intersection(right)) / max(1, min(len(left), len(right)))
+
+
+def _normalize_title_token(token: str) -> str:
+    normalized = str(token or "").strip().lower()
+    if not normalized:
+        return ""
+
+    for suffix in TITLE_TOKEN_SUFFIXES:
+        while normalized.endswith(suffix) and len(normalized) > len(suffix) + 1:
+            normalized = normalized[: -len(suffix)].strip()
+
+    if not normalized:
+        return ""
+    if normalized in TITLE_TOKEN_STOPWORDS:
+        return ""
+    if re.fullmatch(r"\d+일", normalized):
+        return ""
+    if re.fullmatch(r"\d+일간", normalized):
+        return ""
+    if re.fullmatch(r"\d+일간의", normalized):
+        return ""
+    if re.fullmatch(r"\d+박\d+일", normalized):
+        return ""
+    if re.fullmatch(r"\d+곳", normalized):
+        return ""
+    if re.fullmatch(r"\d+선", normalized):
+        return ""
+    if len(normalized) <= 1 and not normalized.isdigit():
+        return ""
+    return normalized
+
+
+def _extract_topic_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
+    topic_plan = payload.get("topic_plan") if isinstance(payload, Mapping) else {}
+    if not isinstance(topic_plan, Mapping):
+        topic_plan = {}
+
+    def _value(*names: str) -> str:
+        for name in names:
+            if name in topic_plan:
+                text = to_plain_text(topic_plan.get(name))
+            else:
+                text = to_plain_text(payload.get(name)) if isinstance(payload, Mapping) else ""
+            if text:
+                return text
+        return ""
+
+    return {
+        "plan_key": _value("plan_key", "topic_plan_key"),
+        "title_family": _value("title_family"),
+        "title_family_label": _value("title_family_label"),
+        "content_angle_key": _value("content_angle_key"),
+        "content_angle_label": _value("content_angle_label", "content_angle"),
+        "audience_key": _value("audience_key"),
+        "audience_label": _value("audience_label", "audience"),
+        "duration_days": _coerce_positive_int(topic_plan.get("duration_days") or payload.get("duration_days")),
+        "title_hook": _value("title_hook"),
+    }
+
+
+def _topic_signature_matches(topic_metadata: Mapping[str, Any], signature: RecentPostSignature) -> bool:
+    if not topic_metadata:
+        return False
+
+    matches = 0
+    if topic_metadata.get("title_family") and topic_metadata.get("title_family") == signature.title_family:
+        matches += 1
+    if topic_metadata.get("content_angle_key") and topic_metadata.get("content_angle_key") == signature.content_angle_key:
+        matches += 1
+    if topic_metadata.get("audience_key") and topic_metadata.get("audience_key") == signature.audience_key:
+        matches += 1
+    if topic_metadata.get("duration_days") and int(topic_metadata.get("duration_days") or 0) == signature.duration_days:
+        matches += 1
+    return matches >= 2
+
+
+def _coerce_positive_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
 
 
 def _force_collect_fresh_places(ctx: PipelineContext, scenario: str) -> Dict[str, Any]:
@@ -1336,16 +1551,21 @@ def _candidate_from_ranking(
     scenario: str,
     city: str,
     country: str,
+    audience: str = "korean_traveler",
+    content_angle: str = "",
+    duration_days: int = 0,
 ) -> ArticleCandidate:
     normalized_country = country.strip().lower() if isinstance(country, str) and country.strip() else "unknown"
+    duration_hint = f" {duration_days}일" if duration_days > 0 else ""
+    angle_hint = f" {content_angle}" if content_angle else ""
     return ArticleCandidate(
         topic_key=f"{normalized_country}-{scenario}-{rank_item.payload.get('place_type', 'general')}",
         city=city,
         country=country,
         scenario=scenario,
         place_type=rank_item.payload.get("category", "general"),
-        audience="korean_traveler",
-        query_text=f"{city or country} {scenario} 장소 추천",
+        audience=audience or "korean_traveler",
+        query_text=f"{city or country} {scenario}{duration_hint}{angle_hint} 장소 추천".strip(),
         candidate_place_ids=[str(rank_item.place_id)] if rank_item.place_id else [],
         ranking_version="v1",
         status="draft",

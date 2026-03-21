@@ -277,6 +277,51 @@ class PlaceRepository:
 
         return keys
 
+    def fetch_published_topic_metadata_by_post_ids(
+        self,
+        post_ids: Iterable[int],
+        status: str = "published",
+    ) -> dict[int, dict[str, Any]]:
+        normalized_ids: list[int] = []
+        for value in post_ids:
+            with suppress(Exception):
+                parsed = int(value)
+                if parsed > 0:
+                    normalized_ids.append(parsed)
+        if not self.enabled or not normalized_ids:
+            return {}
+
+        sql = """
+            SELECT
+                wp_post_id,
+                raw_publish_response
+            FROM published_article
+            WHERE status = %s
+              AND wp_post_id = ANY(%s)
+            ORDER BY COALESCE(published_at, created_at) DESC
+        """
+
+        with connect(self.db_url) as connection:
+            connection.row_factory = dict_row
+            with connection.cursor() as cursor:
+                cursor.execute(sql, (status, normalized_ids))
+                rows = cursor.fetchall()
+
+        metadata_by_post_id: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            post_id = row.get("wp_post_id")
+            if not isinstance(post_id, int) or post_id <= 0:
+                continue
+            payload = row.get("raw_publish_response") or {}
+            if isinstance(payload, str):
+                with suppress(Exception):
+                    payload = json.loads(payload)
+            if not isinstance(payload, Mapping):
+                continue
+            metadata_by_post_id[post_id] = dict(payload)
+
+        return metadata_by_post_id
+
     def fetch_place_summaries_by_keys(self, keys: Iterable[str]) -> list[dict[str, Any]]:
         normalized_keys = [str(value).strip() for value in keys if str(value).strip()]
         if not self.enabled or not normalized_keys:
