@@ -69,6 +69,7 @@ def test_render_full_html_document_includes_meta_and_schema():
     assert "<title>" in html
     assert 'meta name="description"' in html
     assert 'meta name="keywords"' in html
+    assert 'meta name="naver-site-verification"' in html
     assert 'rel="canonical"' in html
     assert "application/ld+json" in html
     assert schema["@graph"]

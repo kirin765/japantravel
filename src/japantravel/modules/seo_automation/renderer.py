@@ -22,6 +22,7 @@ def render_full_html_document(payload: Mapping[str, Any], canonical_url: str = "
     head_parts = [
         '<meta charset="utf-8" />',
         '<meta name="viewport" content="width=device-width, initial-scale=1" />',
+        '<meta name="naver-site-verification" content="e2d3117f0f247b020d2d1b63dd52eb966ec19c92" />',
         f"<title>{html.escape(title_tag)}</title>",
         f'<meta name="description" content="{html.escape(description, quote=True)}" />',
     ]
