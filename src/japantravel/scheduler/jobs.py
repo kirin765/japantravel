@@ -8,21 +8,16 @@ from datetime import datetime, timezone
 import html
 import logging
 import re
-from urllib.parse import quote_plus, unquote
-import time
+from urllib.parse import quote_plus, unquote, urlparse
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from ..clients import ApifyClient, GooglePlacesClient, OpenAIClient, WordPressClient
+import requests
+
+from ..clients import GoogleMapScraperClient, GooglePlacesClient, OpenAIClient, WordPressClient
 from ..config.settings import Settings
 from ..modules.generation.formatter import build_post_featured_media_alt_text, build_post_meta_description
 from ..modules.generation.topic_planner import TopicPlan, select_topic_plan
 from ..modules.generation.seo import to_plain_text
-from ..modules.trend_queries import (
-    TrendQueryProvider,
-    build_region_trend_query_plan,
-    build_trend_query_providers,
-    parse_core_region_targets,
-)
 from ..storage import PlaceRepository
 from ..modules.generation import GenerationPipeline
 from ..modules.refresh import RefreshPipeline
@@ -30,11 +25,45 @@ from ..modules.ranking import scorer
 from ..modules.publish import PublishPipeline
 from ..modules.publish.sitemap import verify_post_url_in_sitemap
 from ..modules.review import ReviewPipeline
-from ..shared.exceptions import ExternalServiceError
 from ..shared.models import ArticleCandidate, PublishedArticle
 
 
 logger = logging.getLogger(__name__)
+_IMAGE_URL_VALIDATION_CACHE: dict[str, bool] = {}
+DEFAULT_JAPAN_TOURIST_LOCATION_QUERIES: tuple[str, ...] = (
+    "Tokyo, Japan",
+    "Osaka, Japan",
+    "Kyoto, Japan",
+    "Hokkaido, Japan",
+    "Fukuoka, Japan",
+    "Hiroshima, Japan",
+    "Okinawa, Japan",
+    "Nara, Japan",
+    "Kanazawa, Japan",
+    "Nagoya, Japan",
+    "Yokohama, Japan",
+    "Kobe, Japan",
+    "Sapporo, Japan",
+    "Sendai, Japan",
+    "Kamakura, Japan",
+    "Hakone, Japan",
+    "Nikko, Japan",
+    "Takayama, Japan",
+    "Matsumoto, Japan",
+    "Beppu, Japan",
+)
+DEFAULT_TOURIST_SEARCH_STRINGS: tuple[str, ...] = (
+    "tourist attractions",
+    "sightseeing",
+    "popular attractions",
+    "landmarks",
+    "viewpoints",
+    "temples",
+    "shrines",
+    "castles",
+    "museums",
+    "scenic spots",
+)
 
 
 @dataclass(frozen=True)
@@ -48,7 +77,7 @@ class PipelineContext:
     """In-memory runtime context for scheduled jobs."""
 
     settings: Settings = field(default_factory=Settings)
-    apify: Optional[ApifyClient] = None
+    google_map_scraper: Optional[GoogleMapScraperClient] = None
     google_places: Optional[GooglePlacesClient] = None
     openai: Optional[OpenAIClient] = None
     wp: Optional[WordPressClient] = None
@@ -60,7 +89,7 @@ class PipelineContext:
     published_articles: List[PublishedArticle] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.apify = self.apify or _init_client("apify", ApifyClient)
+        self.google_map_scraper = self.google_map_scraper or _init_client("google_map_scraper", GoogleMapScraperClient)
         self.google_places = self.google_places or _init_client("google_places", GooglePlacesClient)
         self.openai = self.openai or _init_client("openai", OpenAIClient)
         self.wp = self.wp or _init_client("wordpress", WordPressClient)
@@ -168,429 +197,12 @@ def _init_client(name: str, constructor):
         return None
 
 
-def collect_job(context: PipelineContext | None = None) -> Dict[str, Any]:
-    """Collect raw places from Apify and keep candidates in context."""
-    ctx = _ensure_context(context)
-    logger.info("collect_job started")
-
-    city, country = _parse_location(ctx.settings.apify_location_query)
-    cached_count = 0
-    cached_items: list[Dict[str, Any]] = []
-
-    if ctx.place_repo is not None:
-        cached_items = ctx.place_repo.fetch_reusable_candidates(
-            city=city,
-            country=country,
-            limit=ctx.settings.place_cache_fetch_limit,
-            stale_days=ctx.settings.place_cache_ttl_days,
-            strict_fields=ctx.settings.place_cache_strict_fields,
-        )
-        cached_count = len(cached_items)
-        if cached_count >= ctx.settings.place_cache_min_count and not ctx.settings.apify_force_refresh:
-            ctx.raw_collections = cached_items
-            logger.info("collect_job skipped Apify; cached candidates=%s", cached_count)
-            return {
-                "job": "collect",
-                "status": "ok_cached",
-                "count": cached_count,
-                "source": "db",
-                "run_result": {},
-            }
-
-        if not ctx.settings.apify_force_refresh and ctx.place_repo.has_recent_collection(
-            interval_minutes=ctx.settings.apify_min_new_run_interval_minutes,
-        ):
-            if cached_items:
-                ctx.raw_collections = cached_items
-            logger.info("collect_job skipped Apify due to run interval policy; cached candidates=%s", cached_count)
-            return {
-                "job": "collect",
-                "status": "ok_cached",
-                "count": cached_count,
-                "source": "db_recent_only",
-                "run_result": {},
-            }
-
-    if ctx.apify is None or not ctx.settings.apify_actor_id:
-        if cached_items:
-            ctx.raw_collections = cached_items
-            return {"job": "collect", "status": "ok_cached", "count": cached_count, "source": "db"}
-        message = "APIFY client not configured; collect skipped."
-        logger.warning(message)
-        return {"job": "collect", "status": "skipped", "message": message}
-
-    payload = _build_apify_input(ctx.settings)
-    run_result: Dict[str, Any] = {}
-    try:
-        settled = _run_apify_with_fallback(ctx.apify, ctx.settings.apify_actor_id, payload)
-        if not settled.get("succeeded", False):
-            if cached_items:
-                ctx.raw_collections = cached_items
-                return {
-                    "job": "collect",
-                    "status": "ok_cached",
-                    "count": len(cached_items),
-                    "source": "db_fallback",
-                    "run_error": settled.get("error"),
-                    "run_result": settled.get("run", {}),
-                }
-            return {
-                "job": "collect",
-                "status": "error",
-                "error": settled.get("error", "Apify run did not succeed."),
-                "run_result": settled.get("run", {}),
-            }
-        run_result = settled.get("run", {})
-        run_id = run_result.get("id")
-        if not run_id:
-            raise ExternalServiceError("Apify run id not returned")
-
-        raw_items = _apify_payload(ctx.apify.get_run_items(run_id))
-        if isinstance(raw_items, dict):
-            items = raw_items.get("items", [])
-        else:
-            items = raw_items
-
-        if ctx.place_repo is not None and isinstance(items, list):
-            upsert = ctx.place_repo.upsert_places(
-                items,
-                source="apify",
-                actor_id=ctx.settings.apify_actor_id,
-                dataset_id=_run_dataset_id(run_result),
-                conflict_mode="update",
-            )
-            logger.info(
-                "collect_job upserted places count=%s inserted=%s skipped=%s errors=%s",
-                upsert.fetched_count,
-                upsert.inserted_count,
-                upsert.skipped_count,
-                len(upsert.errors),
-            )
-
-        if ctx.place_repo is not None:
-            cached_items = ctx.place_repo.fetch_reusable_candidates(
-                city=city,
-                country=country,
-                limit=ctx.settings.place_cache_fetch_limit,
-                stale_days=ctx.settings.place_cache_ttl_days,
-                strict_fields=ctx.settings.place_cache_strict_fields,
-            )
-            ctx.raw_collections = cached_items
-        else:
-            ctx.raw_collections = list(items or [])
-
-        status = "ok" if ctx.raw_collections else "empty"
-        logger.info("collect_job finished; count=%s", len(ctx.raw_collections))
-        return {
-            "job": "collect",
-            "status": status,
-            "count": len(ctx.raw_collections),
-            "source": "apify_to_db" if ctx.place_repo is not None else "apify",
-            "run_result": run_result,
-            "cached_before": cached_count,
-        }
-    except Exception as exc:  # defensive; keep scheduler alive
-        logger.error("collect_job failed: %s", exc)
-        if cached_items:
-            ctx.raw_collections = cached_items
-            return {
-                "job": "collect",
-                "status": "ok_cached",
-                "count": len(cached_items),
-                "source": "db_fallback",
-                "error": str(exc),
-                "run_result": run_result,
-            }
-        return {"job": "collect", "status": "error", "error": str(exc), "run_result": run_result}
-
-
-def trend_collect_job(context: PipelineContext | None = None) -> Dict[str, Any]:
-    """Collect additional place candidates from Korean travel-intent queries every 48h."""
-    ctx = _ensure_context(context)
-    logger.info("trend_collect_job started")
-
-    if ctx.apify is None or not ctx.settings.apify_actor_id:
-        return {"job": "trend_collect", "status": "skipped", "error": "Apify client is not configured"}
-    if ctx.place_repo is None:
-        return {"job": "trend_collect", "status": "error", "error": "Place repository is not configured (DB_URL missing)"}
-
-    targets = parse_core_region_targets(ctx.settings.trend_core_regions)
-    if not targets:
-        return {"job": "trend_collect", "status": "skipped", "error": "No trend core regions configured"}
-
-    providers = _build_trend_query_provider_chain(ctx.settings)
-    results: list[dict[str, Any]] = []
-    success_count = 0
-    error_count = 0
-
-    for target in targets:
-        plan = build_region_trend_query_plan(
-            target,
-            providers=providers,
-            limit=max(1, ctx.settings.trend_region_query_limit),
-        )
-
-        if not plan.queries:
-            error_count += 1
-            result = {
-                "region": target.display_name,
-                "location_query": target.location_query,
-                "status": "error",
-                "query_count": 0,
-                "queries": [],
-                "providers_attempted": plan.providers_attempted,
-                "providers_used": plan.providers_used,
-                "errors": plan.errors or ["no_queries_generated"],
-            }
-            logger.warning(
-                "trend_collect_job region=%s failed to produce queries providers=%s errors=%s",
-                target.display_name,
-                plan.providers_attempted,
-                result["errors"],
-            )
-            results.append(result)
-            continue
-
-        payload = _build_apify_input(
-            ctx.settings,
-            location_query=target.location_query,
-            search_strings=plan.queries,
-            max_crawled_per_search=ctx.settings.trend_max_crawled_per_search,
-        )
-        run_result: Dict[str, Any] = {}
-        try:
-            settled = _run_apify_with_fallback(ctx.apify, ctx.settings.apify_actor_id, payload)
-            if not settled.get("succeeded", False):
-                error_count += 1
-                result = {
-                    "region": target.display_name,
-                    "location_query": target.location_query,
-                    "status": "error",
-                    "query_count": len(plan.queries),
-                    "queries": plan.queries,
-                    "providers_attempted": plan.providers_attempted,
-                    "providers_used": plan.providers_used,
-                    "errors": plan.errors + [str(settled.get("error", "Apify run did not succeed."))],
-                    "run_result": settled.get("run", {}),
-                }
-                logger.warning(
-                    "trend_collect_job region=%s apify failed error=%s",
-                    target.display_name,
-                    settled.get("error", "Apify run did not succeed."),
-                )
-                results.append(result)
-                continue
-
-            run_result = settled.get("run", {})
-            run_id = run_result.get("id")
-            if not run_id:
-                raise ExternalServiceError("Apify run id not returned")
-
-            raw_items = _apify_payload(ctx.apify.get_run_items(run_id))
-            items = raw_items.get("items", []) if isinstance(raw_items, Mapping) else raw_items
-            if not isinstance(items, list):
-                raise ExternalServiceError("Unexpected Apify items format")
-
-            upsert = ctx.place_repo.upsert_places(
-                items,
-                source="apify",
-                actor_id=ctx.settings.apify_actor_id,
-                dataset_id=_run_dataset_id(run_result),
-                conflict_mode="update",
-            )
-            region_status = "ok" if items else "empty"
-            success_count += 1
-            result = {
-                "region": target.display_name,
-                "location_query": target.location_query,
-                "status": region_status,
-                "query_count": len(plan.queries),
-                "queries": plan.queries,
-                "providers_attempted": plan.providers_attempted,
-                "providers_used": plan.providers_used,
-                "errors": plan.errors,
-                "run_result": run_result,
-                "upsert": {
-                    "fetched_count": upsert.fetched_count,
-                    "inserted_count": upsert.inserted_count,
-                    "reused_count": upsert.reused_count,
-                    "skipped_count": upsert.skipped_count,
-                    "errors": upsert.errors,
-                },
-            }
-            logger.info(
-                "trend_collect_job region=%s queries=%s providers=%s inserted=%s skipped=%s dataset=%s",
-                target.display_name,
-                len(plan.queries),
-                ",".join(plan.providers_used or plan.providers_attempted),
-                upsert.inserted_count,
-                upsert.skipped_count,
-                _run_dataset_id(run_result),
-            )
-            results.append(result)
-        except Exception as exc:
-            error_count += 1
-            logger.warning("trend_collect_job failed region=%s error=%s", target.display_name, exc)
-            results.append(
-                {
-                    "region": target.display_name,
-                    "location_query": target.location_query,
-                    "status": "error",
-                    "query_count": len(plan.queries),
-                    "queries": plan.queries,
-                    "providers_attempted": plan.providers_attempted,
-                    "providers_used": plan.providers_used,
-                    "errors": plan.errors + [str(exc)],
-                    "run_result": run_result,
-                }
-            )
-
-    status = "ok"
-    if error_count and success_count:
-        status = "partial"
-    elif error_count and not success_count:
-        status = "error"
-
-    return {
-        "job": "trend_collect",
-        "status": status,
-        "regions_processed": len(targets),
-        "success_count": success_count,
-        "error_count": error_count,
-        "results": results,
-    }
-
-
-def collect_from_apify_dataset(
-    context: PipelineContext | None = None,
-    dataset_id: Optional[str] = None,
-    limit: Optional[int] = None,
-    conflict_mode: str = "skip",
-) -> Dict[str, Any]:
-    """Load existing Apify Storage dataset items and persist them into DB."""
-    ctx = _ensure_context(context)
-    target_dataset_id = (dataset_id or ctx.settings.apify_dataset_id or "").strip()
-    if not target_dataset_id:
-        return {"job": "collect_dataset", "status": "skipped", "error": "APIFY_DATASET_ID is not configured"}
-
-    if ctx.apify is None:
-        return {"job": "collect_dataset", "status": "skipped", "error": "Apify client is not configured"}
-
-    if ctx.place_repo is None:
-        return {"job": "collect_dataset", "status": "error", "error": "Place repository is not configured (DB_URL missing)"}
-
-    city, country = _parse_location(ctx.settings.apify_location_query)
-    limit = limit if limit is not None else ctx.settings.apify_dataset_item_limit
-    try:
-        payload = ctx.apify.get_dataset_items(target_dataset_id, limit=limit, clean=True)
-        raw_items = _apify_payload(payload)
-        if isinstance(raw_items, Mapping):
-            items = raw_items.get("items", [])
-        else:
-            items = raw_items
-        if not isinstance(items, list):
-            return {
-                "job": "collect_dataset",
-                "status": "error",
-                "error": "Unexpected dataset items format",
-                "dataset_id": target_dataset_id,
-            }
-
-        upsert = ctx.place_repo.upsert_places(
-            items,
-            source="apify",
-            actor_id=ctx.settings.apify_actor_id,
-            dataset_id=target_dataset_id,
-            conflict_mode=conflict_mode,
-        )
-
-        ctx.raw_collections = ctx.place_repo.fetch_reusable_candidates(
-            city=city,
-            country=country,
-            limit=ctx.settings.place_cache_fetch_limit,
-            stale_days=ctx.settings.place_cache_ttl_days,
-            strict_fields=ctx.settings.place_cache_strict_fields,
-        )
-
-        return {
-            "job": "collect_dataset",
-            "status": "ok",
-            "count": len(ctx.raw_collections),
-            "dataset_id": target_dataset_id,
-            "upsert": {
-                "fetched_count": upsert.fetched_count,
-                "inserted_count": upsert.inserted_count,
-                "reused_count": upsert.reused_count,
-                "skipped_count": upsert.skipped_count,
-                "errors": upsert.errors,
-            },
-        }
-    except Exception as exc:  # defensive
-        logger.error("collect_from_apify_dataset failed: %s", exc)
-        return {"job": "collect_dataset", "status": "error", "error": str(exc), "dataset_id": target_dataset_id}
-
-
-def reset_and_collect_from_apify_datasets(
-    context: PipelineContext | None = None,
-    dataset_ids: Optional[List[str] | str] = None,
-    limit: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Reset existing content tables and rebuild places from configured Apify datasets."""
-    ctx = _ensure_context(context)
-    if ctx.place_repo is None:
-        return {"job": "reset_collect_datasets", "status": "error", "error": "Place repository is not configured (DB_URL missing)"}
-    if ctx.apify is None:
-        return {"job": "reset_collect_datasets", "status": "error", "error": "Apify client is not configured"}
-
-    targets = _resolve_dataset_ids(dataset_ids if dataset_ids is not None else ctx.settings.apify_dataset_ids or ctx.settings.apify_dataset_id)
-    if not targets:
-        return {"job": "reset_collect_datasets", "status": "skipped", "error": "No Apify dataset ids configured"}
-
-    ctx.place_repo.reset_all_data()
-
-    results: List[Dict[str, Any]] = []
-    saved_count = 0
-    skipped_count = 0
-    error_count = 0
-
-    for target_dataset_id in targets:
-        result = collect_from_apify_dataset(
-            context=ctx,
-            dataset_id=target_dataset_id,
-            limit=limit,
-            conflict_mode="skip",
-        )
-        results.append(result)
-        upsert = result.get("upsert", {})
-        saved_count += int(upsert.get("inserted_count", 0) or 0)
-        skipped_count += int(upsert.get("skipped_count", upsert.get("reused_count", 0)) or 0)
-        if result.get("status") != "ok":
-            error_count += 1
-
-    status = "ok"
-    if error_count and saved_count:
-        status = "partial"
-    elif error_count and not saved_count:
-        status = "error"
-
-    return {
-        "job": "reset_collect_datasets",
-        "status": status,
-        "dataset_ids": targets,
-        "datasets_processed": len(results),
-        "saved_count": saved_count,
-        "skipped_duplicates": skipped_count,
-        "error_count": error_count,
-        "results": results,
-    }
-
-
 def content_cycle_job(context: PipelineContext | None = None, scenario: str = "solo_travel") -> Dict[str, Any]:
-    """Run generate -> review -> publish sequentially from the latest DB-backed place cache."""
+    """Run generate -> review -> publish with freshly scraped place data."""
     ctx = _ensure_context(context)
     logger.info("content_cycle_job started scenario=%s", scenario)
 
-    # Always reload from DB so manual Apify collections are picked up by the next scheduled cycle.
+    # Reset in-memory state so each scheduled cycle is driven by a fresh scraper run.
     ctx.raw_collections = []
     ctx.article_candidates = []
     ctx.generated_articles = []
@@ -645,16 +257,35 @@ def content_cycle_job(context: PipelineContext | None = None, scenario: str = "s
 
 
 def generate_job(context: PipelineContext | None = None, scenario: str = "solo_travel") -> Dict[str, Any]:
-    """Score and generate article candidates from last collected data."""
+    """Scrape fresh places, persist them, then generate article candidates."""
     ctx = _ensure_context(context)
     logger.info("generate_job started")
 
-    if not ctx.raw_collections and ctx.place_repo is not None:
-        cached = _load_reusable_candidates(ctx, scenario=scenario)
-        ctx.raw_collections = cached
+    if ctx.google_map_scraper is None:
+        return {
+            "job": "generate",
+            "status": "error",
+            "reason": "google_map_scraper_not_configured",
+        }
+
+    collect_result = _force_collect_fresh_places(ctx, scenario=scenario)
+    if collect_result.get("status") not in {"ok", "partial"}:
+        return {
+            "job": "generate",
+            "status": "error",
+            "reason": "place_collection_failed",
+            "collect": collect_result,
+        }
+    if collect_result.get("status") == "partial":
+        logger.warning("generate_job continuing with partial place collection: %s", collect_result.get("failed_locations", []))
 
     if not ctx.raw_collections:
-        return {"job": "generate", "status": "skipped", "reason": "no collected raw data"}
+        return {
+            "job": "generate",
+            "status": "skipped",
+            "reason": "no collected raw data",
+            "collect": collect_result,
+        }
 
     if ctx.openai is None:
         return {"job": "generate", "status": "error", "error": "OpenAI client is not configured"}
@@ -664,12 +295,6 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
         min_count = max(2, ctx.settings.recent_place_min_count)
         excluded_keys = _load_recent_excluded_place_keys(ctx)
         filtered_collections = _filter_places_by_excluded_keys(ctx.raw_collections, excluded_keys)
-        refresh_result: Dict[str, Any] | None = None
-
-        if len(filtered_collections) < target_count and ctx.settings.recent_place_force_apify_on_exhaust:
-            refresh_result = _force_collect_fresh_places(ctx, scenario=scenario)
-            if refresh_result.get("status") == "ok":
-                filtered_collections = _filter_places_by_excluded_keys(ctx.raw_collections, excluded_keys)
 
         if len(filtered_collections) < min_count:
             return {
@@ -678,7 +303,7 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
                 "reason": "insufficient_unique_places",
                 "excluded_place_count": len(excluded_keys),
                 "available_count": len(filtered_collections),
-                "refresh": refresh_result or {},
+                "collect": collect_result,
             }
 
         ctx.raw_collections = filtered_collections
@@ -701,6 +326,7 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
                 "excluded_place_count": len(excluded_keys),
                 "available_count": len(filtered_collections),
                 "recent_post_count": len(recent_signatures),
+                "collect": collect_result,
             }
 
         top = selected_cluster.ranked_items[:target_count]
@@ -780,7 +406,7 @@ def generate_job(context: PipelineContext | None = None, scenario: str = "solo_t
             "selected_place_count": len(top_payloads),
             "selected_region_key": selected_cluster.region_key,
             "topic_plan_key": topic_plan.plan_key,
-            "refresh": refresh_result or {},
+            "collect": collect_result,
         }
     except Exception as exc:
         logger.error("generate_job failed: %s", exc)
@@ -876,21 +502,31 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
                 continue
 
             seo = payload.get("seo") if isinstance(payload.get("seo"), Mapping) else {}
-            content_category = to_plain_text(seo.get("content_category")) or "여행지"
-            category_names = ["japan", payload.get("region", "asia"), content_category]
-            tag_names = [generated.get("candidate_topic", "travel"), "korean_traveler"]
-            term_ids = publisher.resolve_term_ids(categories=category_names, tags=tag_names)
+            taxonomy_terms = _build_public_taxonomy_terms(payload, generated, ctx.settings)
+            term_ids = publisher.resolve_term_ids(
+                categories=taxonomy_terms["categories"],
+                tags=taxonomy_terms["tags"],
+            )
             payload = dict(payload)
+            payload = _sanitize_article_payload_images(payload, ctx.settings)
             internal_links = _select_internal_links(
                 ctx.wp,
-                region_category_id=term_ids["categories"][1] if len(term_ids["categories"]) > 1 else None,
-                content_category_id=term_ids["categories"][2] if len(term_ids["categories"]) > 2 else None,
+                region_tag_id=_resolved_term_id(
+                    taxonomy_terms["tags"],
+                    term_ids["tags"],
+                    taxonomy_terms.get("region_tag", ""),
+                ),
+                content_tag_id=_resolved_term_id(
+                    taxonomy_terms["tags"],
+                    term_ids["tags"],
+                    taxonomy_terms.get("content_tag", ""),
+                ),
                 exclude_title=title,
             )
             payload["internal_links"] = internal_links
             payload["related_posts"] = internal_links.get("same_region", []) + internal_links.get("same_category", [])
             content_html = _format_article_content(payload)
-            featured_media_urls = _collect_featured_images(generated.get("places", []), payload)
+            featured_media_urls = _collect_featured_images(generated.get("places", []), payload, ctx.settings)
             excerpt = build_post_meta_description(payload)
             featured_media_alt_text = build_post_featured_media_alt_text(payload)
             result = publisher.publish(
@@ -945,7 +581,7 @@ def publish_job(context: PipelineContext | None = None) -> Dict[str, Any]:
                     raw_publish_response=raw_publish_response,
                     media_urls=result.get("featured_media_ids", []),
                     categories=result.get("term_ids", {}).get("categories", []),
-                    tags=[str(tag) for tag in tag_names if str(tag).strip()],
+                    tags=[str(tag) for tag in taxonomy_terms["tags"] if str(tag).strip()],
                     published_at=datetime.now(timezone.utc) if result.get("actual_status") == "publish" else None,
                 )
                 if not saved:
@@ -1180,32 +816,55 @@ def _select_region_cluster(
         cluster = clusters.setdefault(region_key, RegionCluster(region_key=region_key, region_label=region_label))
         cluster.ranked_items.append(item)
 
+    recent_region_counts = Counter(signature.region_key for signature in recent_signatures if signature.region_key)
     ordered = sorted(
         clusters.values(),
-        key=lambda cluster: sum(item.score for item in cluster.ranked_items[:target_count]),
+        key=lambda cluster: _cluster_selection_score(
+            cluster=cluster,
+            recent_signatures=recent_signatures,
+            recent_region_counts=recent_region_counts,
+            target_count=target_count,
+            title_threshold=title_threshold,
+        ),
         reverse=True,
     )
     for cluster in ordered:
         if len(cluster.ranked_items) < min_count:
             continue
-        if _cluster_conflicts_with_recent(cluster, recent_signatures, title_threshold):
-            continue
         return cluster
     return None
 
 
-def _cluster_conflicts_with_recent(
+def _cluster_selection_score(
+    cluster: RegionCluster,
+    recent_signatures: list[RecentPostSignature],
+    recent_region_counts: Counter[str],
+    target_count: int,
+    title_threshold: float,
+) -> float:
+    base_score = sum(item.score for item in cluster.ranked_items[:target_count])
+    recent_region_penalty = float(recent_region_counts.get(cluster.region_key, 0)) * 25.0
+    title_overlap_penalty = _cluster_title_overlap_penalty(cluster, recent_signatures, title_threshold)
+    return base_score - recent_region_penalty - title_overlap_penalty
+
+
+def _cluster_title_overlap_penalty(
     cluster: RegionCluster,
     recent_signatures: list[RecentPostSignature],
     title_threshold: float,
-) -> bool:
+) -> float:
     region_tokens = _title_tokens(cluster.region_label)
+    if not region_tokens:
+        return 0.0
+
+    max_overlap = 0.0
     for signature in recent_signatures:
-        if signature.region_key and signature.region_key == cluster.region_key:
-            return True
-        if region_tokens and signature.title_tokens and _token_overlap(region_tokens, signature.title_tokens) >= title_threshold:
-            return True
-    return False
+        if not signature.title_tokens:
+            continue
+        overlap = _token_overlap(region_tokens, signature.title_tokens)
+        if overlap >= title_threshold:
+            max_overlap = max(max_overlap, overlap)
+    return max_overlap * 30.0
 
 
 def _find_recent_duplicate_signature(
@@ -1482,37 +1141,72 @@ def _coerce_positive_int(value: Any) -> int:
 
 
 def _force_collect_fresh_places(ctx: PipelineContext, scenario: str) -> Dict[str, Any]:
-    if ctx.apify is None or not ctx.settings.apify_actor_id:
-        return {"status": "skipped", "reason": "apify not configured"}
+    if ctx.google_map_scraper is None:
+        return {"status": "skipped", "reason": "google-map-scraper not configured"}
 
-    payload = _build_apify_input(ctx.settings)
-    run_result: Dict[str, Any] = {}
+    location_queries = _resolve_place_collect_location_queries(ctx.settings)
+    if not location_queries:
+        return {"status": "error", "error": "No place collection locations configured"}
+
+    aggregated_items: list[dict[str, Any]] = []
+    run_results: list[dict[str, Any]] = []
+    failed_locations: list[str] = []
     try:
-        settled = _run_apify_with_fallback(ctx.apify, ctx.settings.apify_actor_id, payload)
-        if not settled.get("succeeded", False):
+        for location_query in location_queries:
+            payload = _build_google_map_scraper_request(ctx.settings, location_query=location_query)
+            try:
+                scrape_result = ctx.google_map_scraper.scrape_places(**payload)
+            except Exception as exc:
+                failed_locations.append(location_query)
+                logger.warning("force fresh google-map-scraper collection failed location=%s error=%s", location_query, exc)
+                run_results.append(
+                    {
+                        "location_query": location_query,
+                        "status": "error",
+                        "error": str(exc),
+                        "query_count": len(payload.get("search_strings", [])),
+                        "queries": payload.get("search_strings", []),
+                    }
+                )
+                continue
+
+            items = scrape_result.get("items", []) if isinstance(scrape_result, Mapping) else []
+            if not isinstance(items, list):
+                failed_locations.append(location_query)
+                run_results.append(
+                    {
+                        "location_query": location_query,
+                        "status": "error",
+                        "error": "Unexpected scraper items format",
+                        "query_count": len(payload.get("search_strings", [])),
+                        "queries": payload.get("search_strings", []),
+                    }
+                )
+                continue
+
+            aggregated_items.extend(items)
+            run_results.append(
+                {
+                    "location_query": location_query,
+                    "status": "ok",
+                    "query_count": len(payload.get("search_strings", [])),
+                    "queries": payload.get("search_strings", []),
+                    **(scrape_result.get("meta", {}) if isinstance(scrape_result, Mapping) else {}),
+                }
+            )
+
+        if not aggregated_items:
             return {
                 "status": "error",
-                "error": settled.get("error", "Apify run did not succeed."),
-                "run_result": settled.get("run", {}),
+                "error": "No place results returned from any configured location",
+                "run_result": {"locations": run_results},
             }
-
-        run_result = settled.get("run", {})
-        run_id = run_result.get("id")
-        if not run_id:
-            return {"status": "error", "error": "Apify run id not returned", "run_result": run_result}
-
-        raw_items = _apify_payload(ctx.apify.get_run_items(run_id))
-        items = raw_items.get("items", []) if isinstance(raw_items, Mapping) else raw_items
-        if not isinstance(items, list):
-            return {"status": "error", "error": "Unexpected Apify items format", "run_result": run_result}
 
         upsert_summary: Dict[str, Any] = {}
         if ctx.place_repo is not None:
             upsert = ctx.place_repo.upsert_places(
-                items,
-                source="apify",
-                actor_id=ctx.settings.apify_actor_id,
-                dataset_id=_run_dataset_id(run_result),
+                aggregated_items,
+                source="google_map_scraper",
                 conflict_mode="update",
             )
             upsert_summary = {
@@ -1521,19 +1215,20 @@ def _force_collect_fresh_places(ctx: PipelineContext, scenario: str) -> Dict[str
                 "skipped_count": upsert.skipped_count,
                 "errors": upsert.errors,
             }
-            ctx.raw_collections = _load_reusable_candidates(ctx, scenario=f"{scenario}_refresh")
-        else:
-            ctx.raw_collections = list(items)
+        ctx.raw_collections = list(aggregated_items)
 
+        status = "ok" if not failed_locations else "partial"
         return {
-            "status": "ok",
+            "status": status,
             "count": len(ctx.raw_collections),
-            "run_result": run_result,
+            "locations_processed": len(location_queries),
+            "failed_locations": failed_locations,
+            "run_result": {"locations": run_results},
             "upsert": upsert_summary,
         }
     except Exception as exc:
-        logger.warning("force fresh Apify collection failed: %s", exc)
-        return {"status": "error", "error": str(exc), "run_result": run_result}
+        logger.warning("force fresh google-map-scraper collection failed: %s", exc)
+        return {"status": "error", "error": str(exc), "run_result": {"locations": run_results}}
 
 
 def _first_place_db_id(places: Any) -> int | None:
@@ -1653,55 +1348,6 @@ def _normalize_place(raw: Mapping[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def _load_reusable_candidates(ctx: PipelineContext, scenario: str) -> list[dict[str, Any]]:
-    city, country = _parse_location(ctx.settings.apify_location_query)
-    if ctx.place_repo is None:
-        return []
-
-    strict_items = ctx.place_repo.fetch_reusable_candidates(
-        city=city,
-        country=country,
-        limit=max(ctx.settings.top_n_candidates, ctx.settings.place_cache_fetch_limit),
-        stale_days=ctx.settings.place_cache_ttl_days,
-        strict_fields=ctx.settings.place_cache_strict_fields,
-    )
-    if strict_items:
-        logger.info("generate_job loaded %s strict cached candidates", len(strict_items))
-        return strict_items
-
-    relaxed_items = ctx.place_repo.fetch_reusable_candidates(
-        city=city,
-        country=country,
-        limit=max(ctx.settings.top_n_candidates, ctx.settings.place_cache_fetch_limit),
-        stale_days=ctx.settings.place_cache_ttl_days * 2,
-        strict_fields=False,
-    )
-    if relaxed_items:
-        logger.info("generate_job loaded %s relaxed cached candidates for scenario=%s", len(relaxed_items), scenario)
-        return relaxed_items
-
-    # Stored place values may use district names / country codes that do not exactly match APIFY_LOCATION_QUERY.
-    if city or country:
-        fallback_items = ctx.place_repo.fetch_reusable_candidates(
-            city="",
-            country="",
-            limit=max(ctx.settings.top_n_candidates, ctx.settings.place_cache_fetch_limit),
-            stale_days=ctx.settings.place_cache_ttl_days * 2,
-            strict_fields=False,
-        )
-        logger.info(
-            "generate_job loaded %s global fallback cached candidates for scenario=%s location=%s,%s",
-            len(fallback_items),
-            scenario,
-            city,
-            country,
-        )
-        return fallback_items
-
-    logger.info("generate_job loaded %s relaxed cached candidates for scenario=%s", len(relaxed_items), scenario)
-    return relaxed_items
-
-
 def _parse_location(raw: str) -> tuple[str, str]:
     if not raw:
         return "", ""
@@ -1711,6 +1357,18 @@ def _parse_location(raw: str) -> tuple[str, str]:
     if len(parts) == 1:
         return parts[0], ""
     return parts[0], parts[1]
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
 
 
 def _candidate_from_ranking(
@@ -1748,11 +1406,13 @@ def _select_related_posts(
     category_ids: list[int],
     tag_ids: list[int],
     exclude_title: str = "",
+    exclude_slug: str = "",
     limit: int = 3,
 ) -> list[dict[str, str]]:
     selected: list[dict[str, str]] = []
     seen: set[str] = set()
     normalized_title = to_plain_text(exclude_title).lower()
+    normalized_slug = to_plain_text(exclude_slug)
 
     queries: list[dict[str, Any]] = []
     if category_ids and tag_ids:
@@ -1780,7 +1440,11 @@ def _select_related_posts(
             normalized = _normalize_related_post(post)
             if normalized is None:
                 continue
-            if normalized["slug"] in seen or normalized["title"].lower() == normalized_title:
+            if (
+                normalized["slug"] in seen
+                or normalized["title"].lower() == normalized_title
+                or (normalized_slug and normalized["slug"] == normalized_slug)
+            ):
                 continue
             if _looks_like_placeholder_content(normalized["title"], normalized["slug"]):
                 continue
@@ -1795,24 +1459,27 @@ def _select_related_posts(
 def _select_internal_links(
     wp: WordPressClient,
     *,
-    region_category_id: int | None = None,
-    content_category_id: int | None = None,
+    region_tag_id: int | None = None,
+    content_tag_id: int | None = None,
     exclude_title: str = "",
+    exclude_slug: str = "",
 ) -> dict[str, list[dict[str, str]]]:
     same_region = _select_related_posts(
         wp,
-        category_ids=[region_category_id] if region_category_id else [],
-        tag_ids=[],
+        category_ids=[],
+        tag_ids=[region_tag_id] if region_tag_id else [],
         exclude_title=exclude_title,
+        exclude_slug=exclude_slug,
         limit=5,
     )
     seen = {item["slug"] for item in same_region}
     same_category = []
     for item in _select_related_posts(
         wp,
-        category_ids=[content_category_id] if content_category_id else [],
-        tag_ids=[],
+        category_ids=[],
+        tag_ids=[content_tag_id] if content_tag_id else [],
         exclude_title=exclude_title,
+        exclude_slug=exclude_slug,
         limit=6,
     ):
         if item["slug"] in seen:
@@ -1822,6 +1489,74 @@ def _select_internal_links(
         if len(same_category) >= 3:
             break
     return {"same_region": same_region[:5], "same_category": same_category[:3]}
+
+
+def _build_public_taxonomy_terms(
+    payload: Mapping[str, Any],
+    generated: Mapping[str, Any],
+    settings: Settings,
+) -> dict[str, Any]:
+    seo = payload.get("seo") if isinstance(payload.get("seo"), Mapping) else {}
+    region_value = to_plain_text(payload.get("region"))
+    content_value = to_plain_text(seo.get("content_category")) or "travel"
+
+    region_tag = _build_prefixed_tag("region", region_value)
+    content_tag = _build_prefixed_tag("content", content_value)
+    scenario_tag = _build_prefixed_tag("scenario", to_plain_text(payload.get("scenario")))
+    audience_tag = _build_prefixed_tag("audience", to_plain_text(payload.get("audience_key")))
+    angle_tag = _build_prefixed_tag("angle", to_plain_text(payload.get("content_angle_key")))
+    family_tag = _build_prefixed_tag("family", to_plain_text(payload.get("title_family")))
+
+    tag_names = [
+        region_tag,
+        content_tag,
+        scenario_tag,
+        audience_tag,
+        angle_tag,
+        family_tag,
+        _normalize_tag_name(generated.get("candidate_topic")),
+        "korean_traveler",
+    ]
+    tags = [item for item in dict.fromkeys(tag_names) if item]
+    category = to_plain_text(settings.seo_single_post_category) or "japan"
+    return {
+        "categories": [category],
+        "tags": tags,
+        "region_tag": region_tag,
+        "content_tag": content_tag,
+    }
+
+
+def _build_prefixed_tag(prefix: str, value: Any) -> str:
+    normalized = _normalize_tag_name(value)
+    if not normalized:
+        return ""
+    return f"{prefix}-{normalized}"
+
+
+def _normalize_tag_name(value: Any) -> str:
+    text = unquote(to_plain_text(value)).strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"[^a-z0-9가-힣]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    return text
+
+
+def _resolved_term_id(term_values: list[str], resolved_ids: list[int], target_value: str) -> int | None:
+    if not target_value:
+        return None
+    ordered: list[str] = []
+    for value in term_values:
+        normalized = to_plain_text(value)
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
+    if target_value not in ordered:
+        return None
+    target_index = ordered.index(target_value)
+    if target_index >= len(resolved_ids):
+        return None
+    return resolved_ids[target_index]
 
 
 def _build_wp_meta_fields(payload: Mapping[str, Any], settings: Settings) -> dict[str, Any]:
@@ -1874,7 +1609,24 @@ def _looks_like_placeholder_content(title: str, slug: str) -> bool:
     return False
 
 
-def _collect_featured_images(places: Any, payload: Mapping[str, Any]) -> list[str]:
+def _sanitize_article_payload_images(payload: Mapping[str, Any], settings: Settings) -> dict[str, Any]:
+    sanitized = dict(payload)
+    sections = payload.get("place_sections", [])
+    if not isinstance(sections, list):
+        return sanitized
+
+    updated_sections: list[dict[str, Any]] = []
+    for section in sections:
+        if not isinstance(section, Mapping):
+            continue
+        updated_section = dict(section)
+        updated_section["image_urls"] = _filter_valid_image_urls(_collect_image_urls(section), settings)
+        updated_sections.append(updated_section)
+    sanitized["place_sections"] = updated_sections
+    return sanitized
+
+
+def _collect_featured_images(places: Any, payload: Mapping[str, Any], settings: Settings) -> list[str]:
     images: list[str] = []
     for place in places:
         if isinstance(place, Mapping):
@@ -1882,7 +1634,48 @@ def _collect_featured_images(places: Any, payload: Mapping[str, Any]) -> list[st
     for section in payload.get("place_sections", []):
         if isinstance(section, Mapping):
             images.extend(_collect_image_urls(section))
-    return list(dict.fromkeys([img for img in images if _is_http_url(img)]))
+    return _filter_valid_image_urls(images, settings)
+
+
+def _filter_valid_image_urls(urls: list[str], settings: Settings) -> list[str]:
+    blocked_hosts = {
+        host.strip().lower()
+        for host in (settings.seo_block_unstable_image_hosts or "").split(",")
+        if host.strip()
+    }
+    filtered: list[str] = []
+    for url in dict.fromkeys([item for item in urls if _is_http_url(item)]):
+        if _is_excluded_image_url(url, blocked_hosts):
+            continue
+        if settings.seo_validate_remote_images and not _remote_image_url_responds(url, timeout_seconds=min(settings.request_timeout_seconds, 8)):
+            continue
+        filtered.append(url)
+    return filtered
+
+
+def _is_excluded_image_url(url: str, blocked_hosts: set[str]) -> bool:
+    lowered = url.lower()
+    if any(host in lowered for host in blocked_hosts):
+        return True
+    return False
+
+
+def _remote_image_url_responds(url: str, timeout_seconds: int = 8) -> bool:
+    cached = _IMAGE_URL_VALIDATION_CACHE.get(url)
+    if cached is not None:
+        return cached
+
+    try:
+        response = requests.head(url, timeout=timeout_seconds, allow_redirects=True)
+        if response.status_code >= 400 or response.status_code in {405, 501}:
+            response = requests.get(url, timeout=timeout_seconds, allow_redirects=True, stream=True)
+        content_type = str(response.headers.get("content-type") or "").lower()
+        is_valid = response.status_code < 400 and (content_type.startswith("image/") or _is_probable_image_url(url))
+        _IMAGE_URL_VALIDATION_CACHE[url] = is_valid
+        return is_valid
+    except requests.RequestException:
+        _IMAGE_URL_VALIDATION_CACHE[url] = False
+        return False
 
 
 def _collect_image_urls(obj: Mapping[str, Any]) -> list[str]:
@@ -1957,11 +1750,12 @@ def _is_probable_image_url(value: Any) -> bool:
     lowered = str(value).lower().strip()
     if any(token in lowered for token in ("google.com/maps", "/maps/search", "/search/?api=1", "/place/", "output=embed")):
         return False
+    host = urlparse(lowered).netloc
+    if host.endswith("streetviewpixels-pa.googleapis.com"):
+        return False
     if re.search(r"\.(jpg|jpeg|png|webp|gif)(?:\?|$)", lowered):
         return True
-    if any(host in lowered for host in ("googleusercontent.com", "ggpht.com", "streetviewpixels-pa.googleapis.com")):
-        return True
-    if "googleapis.com/v1/thumbnail" in lowered:
+    if any(host in lowered for host in ("googleusercontent.com", "ggpht.com")):
         return True
     return False
 
@@ -1989,126 +1783,35 @@ def _format_article_content(payload: Mapping[str, Any]) -> str:
     return format_wordpress_html_payload(payload, include_map_iframe=True)
 
 
-def _wait_for_run_result(apify: ApifyClient, run_id: str, timeout_seconds: int = 900) -> Dict[str, Any]:
-    terminal_states = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED_OUT", "CANCELLED"}
-    deadline = time.time() + max(1, timeout_seconds)
-    last_status = None
-
-    while time.time() < deadline:
-        run_data = _apify_payload(apify.get_actor_run(run_id))
-        status = str(run_data.get("status", "")).upper()
-        last_status = status
-        if status in terminal_states:
-            if status == "SUCCEEDED":
-                return {"succeeded": True, "run": run_data}
-            return {
-                "succeeded": False,
-                "run": run_data,
-                "error": f"Apify run finished with status: {status}",
-            }
-        time.sleep(2)
-
-    return {
-        "succeeded": False,
-        "run": {"status": last_status or "UNKNOWN"},
-        "error": f"Apify run timeout after {timeout_seconds}s",
-    }
-
-
-def _run_apify_with_fallback(apify: ApifyClient, actor_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Run Apify actor; retry with raw payload when wrapped input is rejected."""
-    attempts: List[tuple[bool, Dict[str, Any]]] = []
-
-    wrapped = apify.run_actor(actor_id, payload=payload, use_raw_payload=False)
-    attempts.append((False, wrapped))
-    settled = _wait_for_run_result(apify, _apify_payload(wrapped).get("id", ""), timeout_seconds=60)
-
-    if settled.get("succeeded"):
-        return settled
-
-    run_data = settled.get("run", {})
-    error_message = str(run_data.get("statusMessage", "")).lower()
-    if "invalid input" in error_message and "searchstringsarray" in error_message:
-        raw = apify.run_actor(actor_id, payload=payload, use_raw_payload=True)
-        attempts.append((True, raw))
-        retry_settled = _wait_for_run_result(apify, _apify_payload(raw).get("id", ""),  timeout_seconds=180)
-        if retry_settled.get("succeeded"):
-            return retry_settled
-        return {
-            "succeeded": False,
-            "run": retry_settled.get("run", raw),
-            "error": retry_settled.get("error", "Apify run did not succeed after fallback"),
-            "attempts": attempts,
-        }
-
-    return {"succeeded": False, "run": run_data, "error": settled.get("error", "Apify run did not succeed."), "attempts": attempts}
-
-
-def _apify_payload(payload: Any) -> Any:
-    if not isinstance(payload, Mapping):
-        return payload if isinstance(payload, list) else {}
-    return payload.get("data", payload)
-
-
-def _run_dataset_id(run_result: Mapping[str, Any]) -> Optional[str]:
-    if not isinstance(run_result, Mapping):
-        return None
-    value = run_result.get("defaultDatasetId") or run_result.get("datasetId")
-    text = str(value).strip() if value is not None else ""
-    return text or None
-
-
-def _resolve_dataset_ids(raw_value: Any) -> List[str]:
-    if raw_value is None:
-        return []
-    if isinstance(raw_value, list):
-        items = [str(item).strip() for item in raw_value]
-        return [item for item in items if item]
-    text = str(raw_value).replace(",", "\n")
-    return [item.strip() for item in text.splitlines() if item.strip()]
-
-
-def _build_trend_query_provider_chain(settings: Settings) -> list[TrendQueryProvider]:
-    seed_keywords = [item.strip() for item in (settings.trend_seed_keywords or "").split(",") if item.strip()]
-    return build_trend_query_providers(
-        trend_source=settings.trend_source,
-        seed_keywords=seed_keywords,
-        timeframe=settings.trend_google_timeframe,
-    )
-
-
-def _build_apify_input(
+def _build_google_map_scraper_request(
     settings: Settings,
     *,
     location_query: str | None = None,
     search_strings: List[str] | None = None,
-    max_crawled_per_search: int | None = None,
+    max_results_per_search: int | None = None,
 ) -> Dict[str, Any]:
     resolved_search_strings = list(search_strings or [])
     if not resolved_search_strings:
-        resolved_search_strings = [s.strip() for s in (settings.apify_search_strings or "").split(",") if s.strip()]
-    search_strings = resolved_search_strings
-    if not search_strings:
-        search_strings = ["popular attractions"]
+        resolved_search_strings = [s.strip() for s in (settings.place_collect_search_strings or "").split(",") if s.strip()]
+    if not resolved_search_strings:
+        resolved_search_strings = list(DEFAULT_TOURIST_SEARCH_STRINGS)
+    search_strings = _dedupe_preserve_order(resolved_search_strings)
 
-    default_search = search_strings[0]
-    crawl_limit = max_crawled_per_search or settings.apify_max_crawled_per_search
-    payload: Dict[str, Any] = {
-        "searchString": default_search,
-        "searchStringsArray": search_strings,
-        "maxCrawledPlacesPerSearch": crawl_limit,
-        "maxCrawledPlaces": crawl_limit,
-        "language": settings.apify_language,
-        "proxyConfig": {
-            "useApifyProxy": True,
-        },
+    resolved_location_query = location_query if location_query is not None else settings.place_collect_location_query
+    return {
+        "location_query": resolved_location_query or "",
+        "search_strings": search_strings,
+        "max_results_per_search": max_results_per_search or settings.place_collect_max_results_per_search,
+        "language": settings.place_collect_language,
     }
 
-    resolved_location_query = location_query if location_query is not None else settings.apify_location_query
-    if resolved_location_query:
-        payload["locationQuery"] = resolved_location_query
 
-    return payload
+def _resolve_place_collect_location_queries(settings: Settings) -> list[str]:
+    raw_values = settings.place_collect_location_queries or settings.place_collect_location_query or ""
+    if not raw_values.strip():
+        return list(DEFAULT_JAPAN_TOURIST_LOCATION_QUERIES)
+    normalized = raw_values.replace("|", "\n")
+    return _dedupe_preserve_order([line.strip() for line in normalized.splitlines() if line.strip()])
 
 
 def _derive_business_status(places: Any) -> str:
