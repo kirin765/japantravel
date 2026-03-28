@@ -1,20 +1,38 @@
-"""Identify and optionally privatize placeholder WordPress posts/pages."""
+"""Identify and optionally privatize placeholder or broken public WordPress URLs."""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import re
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
+
+import requests
 
 from japantravel.clients.wordpress_client import WordPressClient
+from japantravel.config.settings import Settings
 from japantravel.modules.generation.seo import to_plain_text
+from japantravel.modules.publish.sitemap import verify_post_url_in_sitemap
+
+
+@dataclass(frozen=True)
+class CleanupTarget:
+    item_type: str
+    item_id: int
+    title: str
+    slug: str
+    link: str
+    reason: str
+    frontend_status: int = 0
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Privatize placeholder posts/pages on WordPress.")
+    parser = argparse.ArgumentParser(description="Privatize placeholder or frontend-404 public WordPress content.")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--include-pages", action="store_true")
-    parser.add_argument("--limit", type=int, default=30)
+    parser.add_argument("--status", default="publish")
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--page-size", type=int, default=100)
+    parser.add_argument("--verify-sitemap", action="store_true")
     return parser.parse_args()
 
 
@@ -34,43 +52,130 @@ def _looks_like_placeholder(title: str, slug: str) -> bool:
     return False
 
 
-def _iter_items(items: Iterable[Mapping[str, Any]]) -> list[tuple[int, str, str]]:
-    result: list[tuple[int, str, str]] = []
-    for item in items:
-        item_id = item.get("id")
-        if not isinstance(item_id, int):
-            continue
-        title = to_plain_text((item.get("title") or {}).get("rendered") if isinstance(item.get("title"), Mapping) else item.get("title"))
-        slug = to_plain_text(item.get("slug"))
-        if _looks_like_placeholder(title, slug):
-            result.append((item_id, title, slug))
-    return result
+def classify_content_item(
+    item_type: str,
+    item: Mapping[str, Any],
+    *,
+    timeout_seconds: int = 15,
+) -> CleanupTarget | None:
+    item_id = item.get("id")
+    if not isinstance(item_id, int):
+        return None
+    title = to_plain_text((item.get("title") or {}).get("rendered") if isinstance(item.get("title"), Mapping) else item.get("title"))
+    slug = to_plain_text(item.get("slug"))
+    link = to_plain_text(item.get("link"))
+
+    if _looks_like_placeholder(title, slug):
+        return CleanupTarget(item_type=item_type, item_id=item_id, title=title, slug=slug, link=link, reason="placeholder")
+
+    if link:
+        status_code = fetch_frontend_status(link, timeout_seconds=timeout_seconds)
+        if status_code >= 400:
+            return CleanupTarget(
+                item_type=item_type,
+                item_id=item_id,
+                title=title,
+                slug=slug,
+                link=link,
+                reason="frontend_404",
+                frontend_status=status_code,
+            )
+    return None
+
+
+def fetch_frontend_status(url: str, timeout_seconds: int = 15) -> int:
+    try:
+        response = requests.get(url, timeout=timeout_seconds, allow_redirects=True)
+        return int(response.status_code)
+    except requests.RequestException:
+        return 599
+
+
+def iter_cleanup_targets(
+    wp: WordPressClient,
+    *,
+    status: str = "publish",
+    limit: int = 0,
+    page_size: int = 100,
+) -> list[CleanupTarget]:
+    targets: list[CleanupTarget] = []
+    for item_type, list_fn in (("post", wp.list_posts), ("page", wp.list_pages)):
+        for item in _iter_all_items(list_fn, status=status, page_size=page_size, limit=limit):
+            target = classify_content_item(item_type, item)
+            if target is not None:
+                targets.append(target)
+                if limit > 0 and len(targets) >= limit:
+                    return targets
+    return targets
+
+
+def _iter_all_items(
+    list_fn: Callable[..., list[Mapping[str, Any]]],
+    *,
+    status: str,
+    page_size: int,
+    limit: int,
+) -> Iterable[Mapping[str, Any]]:
+    page = 1
+    yielded = 0
+    while True:
+        items = list_fn(per_page=max(1, min(page_size, 100)), page=page, orderby="date", order="desc", status=status)
+        if not items:
+            return
+        for item in items:
+            yield item
+            yielded += 1
+            if limit > 0 and yielded >= limit:
+                return
+        if len(items) < max(1, min(page_size, 100)):
+            return
+        page += 1
 
 
 def main() -> None:
     args = _parse_args()
+    settings = Settings()
     wp = WordPressClient()
 
-    posts = wp.list_posts(per_page=max(args.limit, 1), orderby="date", order="desc", status="publish")
-    pages = wp.list_pages(per_page=max(args.limit, 1), orderby="date", order="desc", status="publish") if args.include_pages else []
-
-    targets = [("post", item_id, title, slug) for item_id, title, slug in _iter_items(posts)]
-    targets.extend(("page", item_id, title, slug) for item_id, title, slug in _iter_items(pages))
-
+    targets = iter_cleanup_targets(
+        wp,
+        status=args.status,
+        limit=max(args.limit, 0),
+        page_size=max(args.page_size, 1),
+    )
     if not targets:
-        print("No placeholder content found.")
+        print("No placeholder or broken public content found.")
         return
 
-    for item_type, item_id, title, slug in targets:
+    updated = 0
+    for target in targets:
         if args.dry_run:
-            print(f"dry-run type={item_type} id={item_id} slug={slug} title={title}")
-            continue
-
-        if item_type == "post":
-            wp.update_post(item_id, status="private")
+            print(
+                f"dry-run type={target.item_type} id={target.item_id} slug={target.slug}"
+                f" reason={target.reason} frontend_status={target.frontend_status or '-'} title={target.title}"
+            )
         else:
-            wp.update_page(item_id, status="private")
-        print(f"privatized type={item_type} id={item_id} slug={slug} title={title}")
+            if target.item_type == "post":
+                wp.update_post(target.item_id, status="private")
+            else:
+                wp.update_page(target.item_id, status="private")
+            updated += 1
+            print(
+                f"privatized type={target.item_type} id={target.item_id} slug={target.slug}"
+                f" reason={target.reason} frontend_status={target.frontend_status or '-'} title={target.title}"
+            )
+
+        if args.verify_sitemap and settings.wordpress_base_url and target.link:
+            verification = verify_post_url_in_sitemap(settings.wordpress_base_url, target.link).to_payload()
+            print(
+                "sitemap"
+                f" id={target.item_id}"
+                f" found={verification.get('found', False)}"
+                f" matched={verification.get('matched_sitemap', '')}"
+                f" error={verification.get('error', '')}"
+            )
+
+    print(f"done total={len(targets)} updated={updated}")
 
 
 if __name__ == "__main__":

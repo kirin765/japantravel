@@ -4,6 +4,7 @@ from japantravel.modules.publish.pipeline import PublishPipeline
 class FakeWordPressClient:
     def __init__(self):
         self.created_posts = []
+        self.updated_posts = []
         self.created_pages = []
         self.updated_media = []
         self.category_counter = 10
@@ -30,6 +31,15 @@ class FakeWordPressClient:
             "status": payload.get("status", "draft"),
             "link": "https://example.com/posts/99",
             "slug": payload.get("slug", "post-99"),
+        }
+
+    def update_post(self, post_id, **payload):
+        self.updated_posts.append((post_id, payload))
+        return {
+            "id": post_id,
+            "status": payload.get("status", "draft"),
+            "link": f"https://example.com/posts/{post_id}",
+            "slug": payload.get("slug", f"post-{post_id}"),
         }
 
     def create_page(self, **payload):
@@ -92,3 +102,25 @@ def test_publish_pipeline_accepts_meta_fields_and_page_publish():
     assert page_result["post_id"] == 109
     assert wp.created_pages[0]["parent"] == 77
     assert wp.created_pages[0]["meta"] == {"seo_description": "도쿄 신주쿠 카페 메타 설명"}
+
+
+def test_publish_pipeline_reuploads_existing_post_by_post_id():
+    wp = FakeWordPressClient()
+    pipeline = PublishPipeline(wp_client=wp)
+
+    result = pipeline.publish(
+        title="도쿄 라멘 맛집 정리",
+        content="<div>새 본문</div>",
+        status="publish",
+        post_id=123,
+        slug="tokyo-ramen-guide",
+        categories=["japan"],
+        tags=["ramen"],
+        featured_media=7,
+    )
+
+    assert result["post_id"] == 123
+    assert wp.created_posts == []
+    assert wp.updated_posts[0][0] == 123
+    assert wp.updated_posts[0][1]["content"] == "<div>새 본문</div>"
+    assert wp.updated_posts[0][1]["slug"] == "tokyo-ramen-guide"

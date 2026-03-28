@@ -24,9 +24,12 @@ def test_format_wordpress_html_payload_uses_h2_h3_and_keyword_alt_text():
                 "place_name": "이치란",
                 "title": "이치란",
                 "body": "- 강점: 접근성이 좋습니다.\n- 방문 팁: 식사 시간대를 피하세요.",
+                "address": "도쿄 신주쿠 1-1-1",
+                "rating": "4.4 / 5.0",
+                "review_count": 321,
                 "image_urls": ["https://example.com/ramen.jpg"],
                 "maps_url": "https://maps.example.com/ichiran",
-                "map_embed_url": "",
+                "map_embed_url": "https://maps.google.com/maps?q=35.0,139.0&output=embed",
             }
         ],
         "route_suggestion": "1. 시작 루트\n신주쿠역 근처에서 시작하세요.\n\n2. 이동 동선\n점심 혼잡도를 피해서 이동하세요.",
@@ -50,10 +53,14 @@ def test_format_wordpress_html_payload_uses_h2_h3_and_keyword_alt_text():
     assert "주변 추천 장소" in rendered
     assert "FAQ" in rendered
     assert "결론" in rendered
+    assert "주소: 도쿄 신주쿠 1-1-1" in rendered
+    assert "평점: 4.4 / 5.0" in rendered
+    assert "리뷰 수: 321건" in rendered
+    assert "<iframe" in rendered
     assert 'alt="도쿄 라멘 맛집 이치란"' in rendered
     assert "jt-inline-links" in rendered
     assert "jt-related-posts" in rendered
-    assert "application/ld+json" in rendered
+    assert "application/ld+json" not in rendered
 
 
 def test_restyle_existing_wordpress_html_removes_duplicate_h1_and_repairs_alt_text():
@@ -79,6 +86,35 @@ def test_restyle_existing_wordpress_html_removes_duplicate_h1_and_repairs_alt_te
     assert "jt-inline-links" in refreshed
     assert "jt-related-posts" in refreshed
     assert "주변 추천 장소" in refreshed
+
+
+def test_format_wordpress_html_payload_skips_duplicate_address_text():
+    payload = {
+        "title": "도쿄 박물관 산책",
+        "region": "도쿄",
+        "summary": "도쿄 박물관 산책 요약",
+        "intro": "인트로",
+        "place_sections": [
+            {
+                "place_id": "1",
+                "place_name": "도쿄 국립박물관",
+                "title": "도쿄 국립박물관",
+                "address": "도쿄 국립박물관",
+                "review_count": 12,
+                "body": "박물관 설명",
+            }
+        ],
+        "route_suggestion": "동선 제안",
+        "checklist": ["체크"],
+        "faq": [{"question": "질문", "answer": "답변"}],
+        "conclusion": "결론",
+        "seo": {"primary_keyword": "도쿄 박물관 산책", "content_category": "여행지"},
+    }
+
+    rendered = format_wordpress_html_payload(payload)
+
+    assert "주소: 도쿄 국립박물관" not in rendered
+    assert "리뷰 수: 12건" in rendered
 
 
 def test_post_meta_helpers_strip_markdown_noise():

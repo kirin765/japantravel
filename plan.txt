@@ -171,7 +171,7 @@ Codex는 아래 범위까지 구현 가능한 구조를 설계해야 한다.
 다음 필드를 기본으로 저장한다.
 
 {
-  "source": "apify|google",
+  "source": "google_map_scraper|google_places|manual",
   "source_id": "",
   "place_id": "",
   "name": "",
@@ -517,7 +517,6 @@ Codex는 아래 결과물을 생성해야 한다.
 
 18. 환경변수 예시
 
-APIFY_TOKEN=
 GOOGLE_MAPS_API_KEY=
 OPENAI_API_KEY=
 WORDPRESS_BASE_URL=

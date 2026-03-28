@@ -81,11 +81,13 @@ class PublishPipeline:
         featured_media_alt_text: str = "",
         meta_fields: Optional[Mapping[str, Any]] = None,
         dry_run: bool = False,
+        post_id: Optional[int] = None,
         **extra_fields: Any,
     ) -> Dict[str, Any]:
         normalized_status = self._normalize_status(status)
         normalized_title = self._normalize_wp_title(title)
         final_slug = self._build_slug(slug or normalized_title)
+        target_post_id = self._normalize_post_id(post_id)
 
         term_ids = self.resolve_term_ids(categories=categories, tags=tags)
         category_ids = term_ids["categories"]
@@ -127,7 +129,7 @@ class PublishPipeline:
             return {
                 "requested_status": status,
                 "actual_status": normalized_status,
-                "post_id": None,
+                "post_id": target_post_id,
                 "post_url": None,
                 "slug": final_slug,
                 "term_ids": {"categories": category_ids, "tags": tag_ids},
@@ -135,9 +137,12 @@ class PublishPipeline:
                 "featured_media_ids": media_ids,
                 "payload": payload,
                 "message": "Dry-run completed; request not sent.",
-            }
+        }
 
-        response = self.wp.create_post(**payload)
+        if target_post_id is None:
+            response = self.wp.create_post(**payload)
+        else:
+            response = self.wp.update_post(target_post_id, **payload)
         media_ids = list(dict.fromkeys([featured_media_id] + featured_media_ids)) if featured_media_id else featured_media_ids
         self._update_media_alt_text(media_ids, featured_media_alt_text)
         return {
@@ -212,6 +217,14 @@ class PublishPipeline:
         if status not in self.STATUS_MAP:
             raise ValueError(f"Unsupported status: {status}")
         return self.STATUS_MAP[status]
+
+    @staticmethod
+    def _normalize_post_id(post_id: Optional[int]) -> Optional[int]:
+        if post_id is None:
+            return None
+        if not isinstance(post_id, int) or post_id <= 0:
+            raise ValueError(f"post_id must be a positive int, got: {post_id!r}")
+        return post_id
 
     def _build_slug(self, text: str, max_length: int = 60) -> str:
         if not text:

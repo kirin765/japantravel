@@ -44,6 +44,9 @@ class PlaceSection:
     place_name: str
     title: str
     body: str
+    address: str
+    rating: str
+    review_count: int
     image_urls: list[str]
     maps_url: str
     map_embed_url: str
@@ -100,16 +103,12 @@ class GeneratedArticle:
                     "place_name": section.place_name,
                     "title": section.title,
                     "body": section.body,
-                }
-                if not (section.image_urls or section.maps_url or section.map_embed_url)
-                else {
-                    "place_id": section.place_id,
-                    "place_name": section.place_name,
-                    "title": section.title,
-                    "body": section.body,
-                    "image_urls": section.image_urls,
-                    "maps_url": section.maps_url,
-                    "map_embed_url": section.map_embed_url,
+                    **({"address": section.address} if section.address else {}),
+                    **({"rating": section.rating} if section.rating else {}),
+                    **({"review_count": section.review_count} if section.review_count > 0 else {}),
+                    **({"image_urls": section.image_urls} if section.image_urls else {}),
+                    **({"maps_url": section.maps_url} if section.maps_url else {}),
+                    **({"map_embed_url": section.map_embed_url} if section.map_embed_url else {}),
                 }
                 for section in self.place_sections
             ],
@@ -263,7 +262,11 @@ class GenerationPipeline:
             place_count=len(selected),
             names=self._place_names(selected),
         )
-        raw_title = self.client.generate(system_prompt=templates.SYSTEM, user_prompt=user_prompt, context=context)
+        raw_title = self.client.generate(
+            system_prompt=templates.SYSTEM,
+            user_prompt=user_prompt,
+            context=self._compact_generation_context(context),
+        )
         return self._normalize_title(raw_title)
 
     @staticmethod
@@ -306,7 +309,7 @@ class GenerationPipeline:
         raw = self.client.generate(
             system_prompt=templates.SYSTEM,
             user_prompt=user_prompt,
-            context={"selected_places": selected, **context},
+            context=self._compact_generation_context(context, selected_places=selected),
         )
         return normalize_generated_text(raw, drop_heading_lines=True)
 
@@ -322,7 +325,7 @@ class GenerationPipeline:
         raw = self.client.generate(
             system_prompt=templates.SYSTEM,
             user_prompt=user_prompt,
-            context={"selected_places": selected, **context},
+            context=self._compact_generation_context(context, selected_places=selected),
         )
         return normalize_generated_text(raw, drop_heading_lines=True)
 
@@ -348,7 +351,11 @@ class GenerationPipeline:
             content = self._retry_generate(
                 system_prompt=templates.SYSTEM_PLACE_SECTION,
                 user_prompt=section_prompt,
-                context={"place": place, "display_rating": rating, "review_count": review_count, **context},
+                context=self._compact_generation_context(
+                    context,
+                    place=place,
+                    extra={"display_rating": rating, "review_count": review_count},
+                ),
             )
             title = self._build_section_title(name=name)
             sections.append(
@@ -357,6 +364,9 @@ class GenerationPipeline:
                     place_name=name,
                     title=title,
                     body=normalize_generated_text(content, drop_heading_lines=True),
+                    address=str(place.get("address", "") or ""),
+                    rating=rating,
+                    review_count=review_count,
                     image_urls=self._collect_image_urls(place),
                     maps_url=str(place.get("maps_url", "") or ""),
                     map_embed_url=str(place.get("maps_embed_url", "") or ""),
@@ -374,6 +384,8 @@ class GenerationPipeline:
         raw = place.get("rating")
         try:
             value = float(raw)
+            if value <= 0:
+                return ""
             return f"{value:.1f} / 5.0"
         except (TypeError, ValueError):
             return ""
@@ -416,7 +428,7 @@ class GenerationPipeline:
         raw = self.client.generate(
             system_prompt=templates.SYSTEM,
             user_prompt=user_prompt,
-            context={"selected_places": selected, **context},
+            context=self._compact_generation_context(context, selected_places=selected),
         )
         return self._normalize_route_suggestion(raw, selected=selected)
 
@@ -436,7 +448,7 @@ class GenerationPipeline:
         raw = self.client.generate(
             system_prompt=templates.SYSTEM,
             user_prompt=user_prompt,
-            context={"selected_places": selected, **context},
+            context=self._compact_generation_context(context, selected_places=selected),
         )
         return self._normalize_checklist(
             self._split_bullets(raw),
@@ -458,7 +470,7 @@ class GenerationPipeline:
         raw = self.client.generate(
             system_prompt=templates.SYSTEM,
             user_prompt=user_prompt,
-            context={"selected_places": selected, **context},
+            context=self._compact_generation_context(context, selected_places=selected),
         )
         return self._split_qa(raw)
 
@@ -473,7 +485,7 @@ class GenerationPipeline:
         raw = self.client.generate(
             system_prompt=templates.SYSTEM,
             user_prompt=user_prompt,
-            context={"selected_places": selected, **context},
+            context=self._compact_generation_context(context, selected_places=selected),
         )
         return normalize_generated_text(raw, drop_heading_lines=True)
 
@@ -527,6 +539,83 @@ class GenerationPipeline:
         if last_exc is not None:
             raise last_exc
         return ""
+
+    def _compact_generation_context(
+        self,
+        context: Mapping[str, Any],
+        *,
+        selected_places: Optional[Sequence[Mapping[str, Any]]] = None,
+        place: Optional[Mapping[str, Any]] = None,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        compact = {
+            "region": self._trim_text(context.get("region"), 120),
+            "scenario": self._trim_text(context.get("scenario", self.scenario), 80),
+            "locale": self._trim_text(context.get("locale", self.locale), 24),
+            "duration_days": self._to_int(context.get("duration_days", 1)) or 1,
+            "budget_level": self._trim_text(context.get("budget_level"), 40),
+            "tone": self._trim_text(context.get("tone"), 40),
+            "variant_id": self._trim_text(context.get("variant_id"), 16),
+            "content_angle": self._trim_text(context.get("content_angle"), 120),
+            "content_angle_key": self._trim_text(context.get("content_angle_key"), 64),
+            "content_angle_label": self._trim_text(context.get("content_angle_label"), 120),
+            "audience": self._trim_text(context.get("audience"), 80),
+            "audience_key": self._trim_text(context.get("audience_key"), 64),
+            "audience_label": self._trim_text(context.get("audience_label"), 120),
+            "title_family": self._trim_text(context.get("title_family"), 80),
+            "title_family_label": self._trim_text(context.get("title_family_label"), 120),
+            "title_hook": self._trim_text(context.get("title_hook"), 120),
+            "plan_key": self._trim_text(context.get("plan_key") or context.get("topic_plan_key"), 64),
+        }
+        compact = {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+        if selected_places is not None:
+            compact["selected_places"] = [self._compact_place(item) for item in selected_places]
+        if place is not None:
+            compact["place"] = self._compact_place(place)
+        if extra:
+            compact.update({key: value for key, value in extra.items() if value not in (None, "", [], {})})
+        return compact
+
+    def _compact_place(self, place: Mapping[str, Any]) -> Dict[str, Any]:
+        compact = {
+            "id": self._trim_text(place.get("id") or place.get("place_id") or place.get("source_id"), 80),
+            "name": self._trim_text(place.get("name"), 120),
+            "city": self._trim_text(place.get("city") or place.get("locality"), 80),
+            "region": self._trim_text(place.get("region") or place.get("state"), 80),
+            "country": self._trim_text(place.get("country"), 80),
+            "category": self._trim_text(place.get("category"), 80),
+            "address": self._trim_text(place.get("address"), 160),
+            "rating": self._to_display_rating(place),
+            "review_count": self._to_int(place.get("review_count", 0)),
+            "price_level": self._trim_text(place.get("price_level"), 40),
+            "business_status": self._trim_text(place.get("business_status"), 80),
+            "opening_hours": self._trim_text(place.get("opening_hours"), 160),
+            "maps_url": self._trim_text(place.get("maps_url"), 240),
+            "website": self._trim_text(place.get("website"), 160),
+            "phone": self._trim_text(place.get("phone"), 40),
+        }
+        image_urls = self._collect_image_urls(place)[:2]
+        if image_urls:
+            compact["image_urls"] = image_urls
+        review_snippets = place.get("review_snippets")
+        if isinstance(review_snippets, Sequence) and not isinstance(review_snippets, (str, bytes)):
+            trimmed_reviews = [
+                self._trim_text(item, 200)
+                for item in review_snippets
+                if self._trim_text(item, 200)
+            ][:2]
+            if trimmed_reviews:
+                compact["review_snippets"] = trimmed_reviews
+        return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+    @staticmethod
+    def _trim_text(value: Any, max_len: int) -> str:
+        if value is None:
+            return ""
+        text = normalize_generated_text(str(value), drop_heading_lines=True)
+        if len(text) <= max_len:
+            return text
+        return f"{text[: max_len - 1].rstrip()}…"
 
     @staticmethod
     def _normalize_route_suggestion(raw: str, selected: Sequence[Mapping[str, Any]]) -> str:

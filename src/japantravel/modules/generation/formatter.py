@@ -18,8 +18,6 @@ from .seo import (
     normalize_generated_text,
     to_plain_text,
 )
-from ..seo_automation.structured_data import build_structured_data_json
-
 ARTICLE_STYLE = (
     "max-width:820px;margin:0 auto;color:#1f2937;font-size:17px;line-height:1.85;"
     "font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,sans-serif;"
@@ -223,7 +221,6 @@ def format_wordpress_html_payload(payload: Mapping[str, Any], include_map_iframe
         parts.append(_render_section("결론", conclusion))
 
     parts.append(f'<div style="{NOTICE_STYLE}">※ 모든 운영시간, 혼잡도, 가격 정보는 방문 직전에 다시 확인하세요.</div>')
-    parts.append(f'<script type="application/ld+json">{build_structured_data_json(payload)}</script>')
     parts.append("</div>")
     return "\n".join(part for part in parts if part)
 
@@ -334,7 +331,7 @@ def _render_section_images(image_label: str, images: List[str], max_images: int 
 def _render_section_map(maps_url: str, map_embed_url: str, include_iframe: bool = True) -> List[str]:
     lines: List[str] = []
     if include_iframe and map_embed_url:
-        lines.append("<div class='apify-map-embed'>")
+        lines.append("<div class='place-map-embed'>")
         lines.append(
             f'<iframe src="{map_embed_url}" width="100%" height="280" style="border:0;" loading="lazy" referrerpolicy="no-referrer-when-downgrade" allowfullscreen></iframe>'
         )
@@ -460,11 +457,28 @@ def _render_place_section(
     image_urls = [url for url in _coerce_strings(section.get("image_urls", [])) if _is_probable_image_url(url)]
     maps_url = to_plain_text(section.get("maps_url", ""))
     map_embed_url = to_plain_text(section.get("map_embed_url", ""))
+    address = to_plain_text(section.get("address", ""))
+    if address and address in {place_name, title}:
+        address = ""
+    rating = to_plain_text(section.get("rating", ""))
+    review_count = _to_int(section.get("review_count", 0))
     image_alt = build_image_alt_text(primary_keyword, place_name, region=region)
 
     parts: List[str] = [f'<article style="{PLACE_CARD_STYLE}">']
     if title:
         parts.append(f'<h3 style="{SUBTITLE_STYLE}">{_format_inline(title)}</h3>')
+    meta_items: list[str] = []
+    if address:
+        meta_items.append(f"주소: {address}")
+    if rating:
+        meta_items.append(f"평점: {rating}")
+    if review_count > 0:
+        meta_items.append(f"리뷰 수: {review_count:,}건")
+    if meta_items:
+        parts.append(f'<ul style="{CHECKLIST_STYLE}">')
+        for item in meta_items:
+            parts.append(f'<li style="{CHECKLIST_ITEM_STYLE}">{_format_inline(item)}</li>')
+        parts.append("</ul>")
     if body:
         parts.append(_render_paragraphs(body))
     if image_urls:
@@ -685,6 +699,13 @@ def _build_faq_html(item: Any) -> str:
         f'<p style="margin:0;color:#475569;line-height:1.85;">A. {_format_inline(answer)}</p>'
         "</div>"
     )
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _coerce_strings(values: Any) -> List[str]:

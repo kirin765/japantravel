@@ -2,7 +2,7 @@
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
-CREATE TYPE place_source AS ENUM ('apify', 'google_places', 'manual');
+CREATE TYPE place_source AS ENUM ('google_map_scraper', 'google_places', 'manual');
 CREATE TYPE article_candidate_status AS ENUM (
     'generated',
     'reviewing',
@@ -20,7 +20,6 @@ CREATE TABLE place (
     source place_source NOT NULL,
     external_place_id TEXT NOT NULL,
     google_place_id TEXT,
-    apify_actor_id TEXT,
     name TEXT NOT NULL,
     description TEXT,
     address TEXT,
@@ -53,28 +52,11 @@ CREATE TABLE place (
     full_address TEXT,
     weekday_hours TEXT[],
     google_maps_place_id TEXT,
-    apify_output JSONB,
-    apify_collected_at TIMESTAMPTZ,
-    dataset_id TEXT,
-    dataset_item_id TEXT,
-    payload_version TEXT DEFAULT 'crawler-google-places-v1',
     raw_payload JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     CONSTRAINT uq_place_source_external UNIQUE (source, external_place_id)
-);
-
-CREATE TABLE IF NOT EXISTS place_apify_output_snapshot (
-    id BIGSERIAL PRIMARY KEY,
-    place_id BIGINT NOT NULL REFERENCES place(id) ON DELETE CASCADE,
-    dataset_id TEXT NOT NULL,
-    dataset_item_id TEXT,
-    apify_output JSONB NOT NULL,
-    apify_payload_checksum CHAR(64),
-    collected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_place_dataset_item UNIQUE (place_id, dataset_id, dataset_item_id)
 );
 
 CREATE TABLE article_candidate (
@@ -178,17 +160,12 @@ CREATE TABLE error_logs (
 CREATE INDEX idx_place_source_ext ON place(source, external_place_id);
 CREATE INDEX idx_place_region_active ON place(region, is_active);
 CREATE INDEX idx_place_business_status ON place (business_status);
-CREATE INDEX idx_place_dataset ON place (dataset_id, external_place_id);
-CREATE INDEX idx_place_apify_place_id ON place (google_place_id);
+CREATE INDEX idx_place_google_place_id ON place (google_place_id);
 CREATE INDEX idx_place_rating_review ON place (rating DESC, review_count DESC);
 CREATE INDEX idx_place_image_urls ON place USING gin(image_urls);
 CREATE INDEX idx_place_rank_base ON place(is_active, rating DESC, review_count DESC, updated_at DESC) WHERE is_active = TRUE;
 CREATE INDEX idx_place_name_trgm ON place USING gin(name gin_trgm_ops);
-CREATE INDEX idx_place_output_gin ON place USING gin(apify_output);
-
-CREATE INDEX idx_place_snapshot_dataset ON place_apify_output_snapshot (dataset_id, collected_at DESC);
-CREATE INDEX idx_place_snapshot_place ON place_apify_output_snapshot (place_id);
-CREATE INDEX idx_place_snapshot_output_gin ON place_apify_output_snapshot USING gin(apify_output);
+CREATE INDEX idx_place_raw_payload_gin ON place USING gin(raw_payload);
 
 CREATE INDEX idx_article_candidate_status_rank
   ON article_candidate(status, rank_score DESC, created_at DESC);

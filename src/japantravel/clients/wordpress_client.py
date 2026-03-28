@@ -138,6 +138,12 @@ class WordPressClient(BaseClient):
             payload["parent"] = parent
         return self.json_request("POST", "/categories", json=payload)
 
+    def update_category(self, category_id: int, **fields: Any) -> Dict[str, Any]:
+        return self.json_request("POST", f"/categories/{category_id}", json=fields)
+
+    def delete_category(self, category_id: int, force: bool = True) -> Dict[str, Any]:
+        return self.json_request("DELETE", f"/categories/{category_id}", params={"force": str(force).lower()})
+
     def list_tags(self, **params: Any) -> list[Dict[str, Any]]:
         return self.json_request("GET", "/tags", params=params)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 import re
+from urllib.parse import quote_plus
 
 from ..generation.seo import (
     build_keyword_list,
@@ -136,10 +137,12 @@ def _place_section(place: Mapping[str, Any], region_name: str, category_name: st
         "place_name": name,
         "title": name,
         "body": "\n\n".join(body_parts),
+        "address": address,
+        "rating": f"{rating:.1f} / 5.0" if rating > 0 else "",
+        "review_count": review_count,
         "image_urls": list(place.get("image_urls") or [])[:2],
         "maps_url": to_plain_text(place.get("maps_url")),
-        "map_embed_url": "",
-        "address": address,
+        "map_embed_url": _infer_map_embed_url(place),
         "category": category,
         "primary_keyword": primary_keyword,
     }
@@ -212,3 +215,23 @@ def _build_conclusion(target: SeoKeywordTarget, selected: Sequence[Mapping[str, 
 
 def _tokenize(value: str) -> set[str]:
     return {token for token in re.split(r"[\s,/]+", to_plain_text(value).lower()) if token}
+
+
+def _infer_map_embed_url(place: Mapping[str, Any]) -> str:
+    direct = to_plain_text(place.get("map_embed_url") or place.get("maps_embed_url"))
+    if direct:
+        return direct
+
+    maps_url = to_plain_text(place.get("maps_url"))
+    if maps_url and "output=embed" in maps_url:
+        return maps_url
+
+    lat = place.get("lat") or place.get("latitude")
+    lng = place.get("lng") or place.get("longitude")
+    if lat not in (None, "") and lng not in (None, ""):
+        return f"https://maps.google.com/maps?q={lat},{lng}&output=embed"
+
+    query = to_plain_text(place.get("name")) or to_plain_text(place.get("address"))
+    if query:
+        return f"https://maps.google.com/maps?q={quote_plus(query)}&output=embed"
+    return ""

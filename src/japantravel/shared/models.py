@@ -13,7 +13,7 @@ class GenerationInput(BaseModel):
 
 
 class PlaceCandidate(BaseModel):
-    source: str = "apify"
+    source: str = "google_map_scraper"
     source_id: str = ""
     place_id: str = ""
     name: str = ""

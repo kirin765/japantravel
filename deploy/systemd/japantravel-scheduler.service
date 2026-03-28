@@ -1,0 +1,16 @@
+[Unit]
+Description=JapanTravel content scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/japantravel
+EnvironmentFile=/root/japantravel/.env
+Environment=PYTHONPATH=/root/japantravel/src
+ExecStart=/root/japantravel/.venv/bin/python -m japantravel.main
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -39,6 +39,8 @@ class PlaceRepository:
         self.db_url = db_url
         self.logger = logging.getLogger(self.__class__.__name__)
         self.enabled = bool(db_url)
+        self._place_columns_cache: Optional[set[str]] = None
+        self._place_source_values_cache: Optional[set[str]] = None
 
     def fetch_reusable_candidates(
         self,
@@ -126,7 +128,6 @@ class PlaceRepository:
                         publish_logs,
                         published_article,
                         article_candidate,
-                        place_apify_output_snapshot,
                         place
                     RESTART IDENTITY CASCADE
                     """
@@ -136,9 +137,7 @@ class PlaceRepository:
     def upsert_places(
         self,
         raw_places: list[Mapping[str, Any]],
-        source: str = "apify",
-        actor_id: Optional[str] = None,
-        dataset_id: Optional[str] = None,
+        source: str = "google_map_scraper",
         conflict_mode: str = "update",
     ) -> PlaceRepositoryResult:
         if not self.enabled or not raw_places:
@@ -149,17 +148,16 @@ class PlaceRepository:
         inserted_count = 0
         skipped_count = 0
         errors: list[str] = []
-        sql = self._place_upsert_sql(conflict_mode)
-
         with connect(self.db_url) as connection:
             connection.row_factory = dict_row
+            place_columns = self._place_columns(connection)
+            sql = self._place_upsert_sql(conflict_mode, place_columns)
+            resolved_source = self._resolve_supported_source(connection, source)
             with connection.cursor() as cursor:
                 for raw in raw_places:
                     normalized = self._normalize_raw(
                         raw,
-                        source=source,
-                        actor_id=actor_id,
-                        dataset_id=dataset_id,
+                        source=resolved_source,
                     )
                     if not normalized:
                         continue
@@ -213,11 +211,12 @@ class PlaceRepository:
 
         return int(total[0]) if total else 0
 
-    def has_recent_collection(self, interval_minutes: int = 240, source: str = "apify") -> bool:
+    def has_recent_collection(self, interval_minutes: int = 240, source: str = "google_map_scraper") -> bool:
         if interval_minutes <= 0:
             return False
         threshold = datetime.now(timezone.utc) - timedelta(minutes=interval_minutes)
         with connect(self.db_url) as connection:
+            resolved_source = self._resolve_supported_source(connection, source)
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -228,13 +227,13 @@ class PlaceRepository:
                           AND updated_at >= %s
                     )
                     """,
-                    (source, threshold),
+                    (resolved_source, threshold),
                 )
                 row = cursor.fetchone()
 
         return bool(row and row[0])
 
-    def fetch_recent_published_place_keys(self, limit: int = 5, status: str = "published") -> set[str]:
+    def fetch_recent_published_place_keys(self, limit: int = 10, status: str = "published") -> set[str]:
         if not self.enabled or limit <= 0:
             return set()
 
@@ -517,7 +516,7 @@ class PlaceRepository:
             "last_verified_at": self._datetime_to_iso(raw_payload.get("last_verified_at") or row.get("updated_at") or row.get("created_at")),
             "collected_at": self._datetime_to_iso(row.get("created_at")),
             "raw_payload": dict(raw_payload) if isinstance(raw_payload, Mapping) else {},
-            "source": self._to_str(row.get("source")) or "apify",
+            "source": self._to_str(row.get("source")) or "google_map_scraper",
             "tags": tags,
         }
 
@@ -544,9 +543,7 @@ class PlaceRepository:
     def _normalize_raw(
         self,
         raw: Mapping[str, Any],
-        source: str = "apify",
-        actor_id: Optional[str] = None,
-        dataset_id: Optional[str] = None,
+        source: str = "google_map_scraper",
     ) -> dict[str, Any] | None:
         source_id = self._resolve_place_id(raw)
         if not source_id:
@@ -610,7 +607,7 @@ class PlaceRepository:
             or self._nested_value(raw.get("openingHours"), "weekday_text")
         )
         image_urls = self._extract_image_urls(raw_payload)
-        apify_collected_at = self._to_optional_str(
+        collected_at = self._to_optional_str(
             raw.get("scrapedAt")
             or raw.get("collectedAt")
             or raw.get("searchDate")
@@ -627,7 +624,6 @@ class PlaceRepository:
                 or raw.get("placeId")
                 or source_id
             ),
-            "apify_actor_id": self._to_str(raw_payload.get("apify_actor_id") or raw.get("actorId") or actor_id),
             "name": self._to_str(raw.get("name") or raw.get("title") or "Unnamed place"),
             "description": self._to_str(
                 raw.get("description")
@@ -664,164 +660,140 @@ class PlaceRepository:
             "full_address": full_address,
             "weekday_hours": weekday_hours,
             "google_maps_place_id": self._to_str(raw.get("googleMapsPlaceId") or raw.get("google_maps_place_id")),
-            "apify_output": json.dumps(raw_payload, ensure_ascii=False),
-            "apify_collected_at": apify_collected_at,
-            "dataset_id": self._to_optional_str(dataset_id),
-            "dataset_item_id": self._resolve_dataset_item_id(raw),
-            "payload_version": "crawler-google-places-v1",
+            "collected_at": collected_at,
             "raw_payload": json.dumps(raw_payload, ensure_ascii=False),
         }
         return {"params": params, "external_place_id": source_id}
 
-    def _place_upsert_sql(self, conflict_mode: str) -> str:
+    def _place_upsert_sql(self, conflict_mode: str, place_columns: set[str]) -> str:
+        ordered_columns = [
+            "source",
+            "external_place_id",
+            "google_place_id",
+            "name",
+            "description",
+            "address",
+            "region",
+            "country",
+            "latitude",
+            "longitude",
+            "category",
+            "rating",
+            "review_count",
+            "price_level",
+            "is_open",
+            "place_url",
+            "google_maps_url",
+            "name_local",
+            "locality",
+            "state",
+            "country_code",
+            "zip",
+            "phone_number",
+            "rating_count",
+            "review_count_delta",
+            "yelp_rating",
+            "google_score",
+            "business_status",
+            "open_hours",
+            "image_urls",
+            "website",
+            "short_address",
+            "full_address",
+            "weekday_hours",
+            "google_maps_place_id",
+            "raw_payload",
+            "is_active",
+            "updated_at",
+        ]
+        insert_columns = [column for column in ordered_columns if column in place_columns]
+        insert_values = [
+            "TRUE" if column == "is_active" else "NOW()" if column == "updated_at" else f"%({column})s"
+            for column in insert_columns
+        ]
+
         conflict_clause = """
             ON CONFLICT (source, external_place_id)
             DO NOTHING
             RETURNING id
         """
         if conflict_mode == "update":
-            conflict_clause = """
+            update_assignments: list[str] = []
+            for column in insert_columns:
+                if column in {"source", "external_place_id"}:
+                    continue
+                if column == "updated_at":
+                    update_assignments.append("updated_at = NOW()")
+                elif column == "is_active":
+                    update_assignments.append("is_active = TRUE")
+                elif column == "google_place_id":
+                    update_assignments.append(f"{column} = COALESCE(EXCLUDED.{column}, place.{column})")
+                else:
+                    update_assignments.append(f"{column} = EXCLUDED.{column}")
+            conflict_clause = f"""
                 ON CONFLICT (source, external_place_id)
                 DO UPDATE SET
-                    google_place_id = COALESCE(EXCLUDED.google_place_id, place.google_place_id),
-                    apify_actor_id = COALESCE(EXCLUDED.apify_actor_id, place.apify_actor_id),
-                    name = EXCLUDED.name,
-                    description = EXCLUDED.description,
-                    address = EXCLUDED.address,
-                    region = EXCLUDED.region,
-                    country = EXCLUDED.country,
-                    latitude = EXCLUDED.latitude,
-                    longitude = EXCLUDED.longitude,
-                    category = EXCLUDED.category,
-                    rating = EXCLUDED.rating,
-                    review_count = EXCLUDED.review_count,
-                    price_level = EXCLUDED.price_level,
-                    is_open = EXCLUDED.is_open,
-                    place_url = EXCLUDED.place_url,
-                    google_maps_url = EXCLUDED.google_maps_url,
-                    name_local = EXCLUDED.name_local,
-                    locality = EXCLUDED.locality,
-                    state = EXCLUDED.state,
-                    country_code = EXCLUDED.country_code,
-                    zip = EXCLUDED.zip,
-                    phone_number = EXCLUDED.phone_number,
-                    rating_count = EXCLUDED.rating_count,
-                    review_count_delta = EXCLUDED.review_count_delta,
-                    yelp_rating = EXCLUDED.yelp_rating,
-                    google_score = EXCLUDED.google_score,
-                    business_status = EXCLUDED.business_status,
-                    open_hours = EXCLUDED.open_hours,
-                    image_urls = EXCLUDED.image_urls,
-                    website = EXCLUDED.website,
-                    short_address = EXCLUDED.short_address,
-                    full_address = EXCLUDED.full_address,
-                    weekday_hours = EXCLUDED.weekday_hours,
-                    google_maps_place_id = EXCLUDED.google_maps_place_id,
-                    apify_output = EXCLUDED.apify_output,
-                    apify_collected_at = COALESCE(EXCLUDED.apify_collected_at, place.apify_collected_at),
-                    dataset_id = COALESCE(EXCLUDED.dataset_id, place.dataset_id),
-                    dataset_item_id = COALESCE(EXCLUDED.dataset_item_id, place.dataset_item_id),
-                    payload_version = COALESCE(EXCLUDED.payload_version, place.payload_version),
-                    raw_payload = EXCLUDED.raw_payload,
-                    is_active = TRUE,
-                    updated_at = NOW()
+                    {", ".join(update_assignments)}
                 RETURNING id
             """
 
         return f"""
             INSERT INTO place (
-                source,
-                external_place_id,
-                google_place_id,
-                apify_actor_id,
-                name,
-                description,
-                address,
-                region,
-                country,
-                latitude,
-                longitude,
-                category,
-                rating,
-                review_count,
-                price_level,
-                is_open,
-                place_url,
-                google_maps_url,
-                name_local,
-                locality,
-                state,
-                country_code,
-                zip,
-                phone_number,
-                rating_count,
-                review_count_delta,
-                yelp_rating,
-                google_score,
-                business_status,
-                open_hours,
-                image_urls,
-                website,
-                short_address,
-                full_address,
-                weekday_hours,
-                google_maps_place_id,
-                apify_output,
-                apify_collected_at,
-                dataset_id,
-                dataset_item_id,
-                payload_version,
-                raw_payload,
-                is_active,
-                updated_at
+                {", ".join(insert_columns)}
             ) VALUES (
-                %(source)s,
-                %(external_place_id)s,
-                %(google_place_id)s,
-                %(apify_actor_id)s,
-                %(name)s,
-                %(description)s,
-                %(address)s,
-                %(region)s,
-                %(country)s,
-                %(latitude)s,
-                %(longitude)s,
-                %(category)s,
-                %(rating)s,
-                %(review_count)s,
-                %(price_level)s,
-                %(is_open)s,
-                %(place_url)s,
-                %(google_maps_url)s,
-                %(name_local)s,
-                %(locality)s,
-                %(state)s,
-                %(country_code)s,
-                %(zip)s,
-                %(phone_number)s,
-                %(rating_count)s,
-                %(review_count_delta)s,
-                %(yelp_rating)s,
-                %(google_score)s,
-                %(business_status)s,
-                %(open_hours)s,
-                %(image_urls)s,
-                %(website)s,
-                %(short_address)s,
-                %(full_address)s,
-                %(weekday_hours)s,
-                %(google_maps_place_id)s,
-                %(apify_output)s,
-                %(apify_collected_at)s,
-                %(dataset_id)s,
-                %(dataset_item_id)s,
-                %(payload_version)s,
-                %(raw_payload)s,
-                TRUE,
-                NOW()
+                {", ".join(insert_values)}
             )
             {conflict_clause}
         """
+
+    def _place_columns(self, connection) -> set[str]:
+        if self._place_columns_cache is not None:
+            return self._place_columns_cache
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'place'
+                """
+            )
+            self._place_columns_cache = {
+                value
+                for value in (self._scalar_row_value(row) for row in cursor.fetchall())
+                if value
+            }
+        return self._place_columns_cache
+
+    def _supported_place_sources(self, connection) -> set[str]:
+        if self._place_source_values_cache is not None:
+            return self._place_source_values_cache
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT e.enumlabel
+                FROM pg_type t
+                JOIN pg_enum e ON t.oid = e.enumtypid
+                WHERE t.typname = 'place_source'
+                """
+            )
+            values = {
+                value
+                for value in (self._scalar_row_value(row) for row in cursor.fetchall())
+                if value
+            }
+        self._place_source_values_cache = values
+        return values
+
+    def _resolve_supported_source(self, connection, source: str) -> str:
+        normalized = self._to_str(source) or "manual"
+        supported = self._supported_place_sources(connection)
+        if not supported or normalized in supported:
+            return normalized
+        if normalized == "google_map_scraper" and "manual" in supported:
+            return "manual"
+        if "manual" in supported:
+            return "manual"
+        return normalized
 
     def _resolve_place_id(self, raw: Mapping[str, Any]) -> str:
         return (
@@ -834,14 +806,16 @@ class PlaceRepository:
             or self._to_str(raw.get("id"))
         )
 
-    def _resolve_dataset_item_id(self, raw: Mapping[str, Any]) -> Optional[str]:
-        return self._to_optional_str(
-            raw.get("dataset_item_id")
-            or raw.get("datasetItemId")
-            or raw.get("itemId")
-            or raw.get("_id")
-            or raw.get("__itemId")
-        )
+    def _scalar_row_value(self, row: Any) -> str:
+        if isinstance(row, Mapping):
+            for value in row.values():
+                text = self._to_str(value)
+                if text:
+                    return text
+            return ""
+        if isinstance(row, (tuple, list)) and row:
+            return self._to_str(row[0])
+        return self._to_str(row)
 
     def _json_value(self, value: Any) -> Optional[str]:
         if value is None:

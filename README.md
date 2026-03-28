@@ -1,7 +1,7 @@
 # Japan Travel Pipeline (Scaffold)
 
 This repository contains a structural scaffold for a content generation pipeline with:
-- Apify client wrapper
+- local `google-map-scraper` collection wrapper
 - Google Places client wrapper
 - OpenAI client wrapper
 - WordPress client wrapper

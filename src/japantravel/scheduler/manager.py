@@ -8,7 +8,7 @@ import time
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from ..config.settings import Settings
-from .jobs import PipelineContext, collect_job, content_cycle_job, refresh_job, trend_collect_job
+from .jobs import PipelineContext, content_cycle_job, refresh_job
 
 
 class SchedulerManager:
@@ -18,22 +18,6 @@ class SchedulerManager:
         self.context = PipelineContext(settings=self.settings)
 
     def bootstrap(self) -> None:
-        if self.settings.scheduler_enable_apify_collect:
-            self.scheduler.add_job(
-                collect_job,
-                "interval",
-                minutes=60,
-                kwargs={"context": self.context},
-            )
-
-        if self.settings.scheduler_enable_trend_collect:
-            self.scheduler.add_job(
-                trend_collect_job,
-                "interval",
-                hours=max(1, self.settings.scheduler_trend_collect_interval_hours),
-                kwargs={"context": self.context},
-            )
-
         self.scheduler.add_job(
             content_cycle_job,
             "interval",
