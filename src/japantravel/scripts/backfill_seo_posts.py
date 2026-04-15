@@ -17,24 +17,53 @@ from japantravel.modules.generation.seo import (
     to_plain_text,
 )
 from japantravel.modules.publish.sitemap import verify_post_url_in_sitemap
+from japantravel.shared.exceptions import ExternalServiceError
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backfill SEO updates for recent WordPress posts.")
     parser.add_argument("--post-id", dest="post_ids", action="append", type=int, default=[])
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--all", action="store_true")
     parser.add_argument("--status", default="publish")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify-sitemap", action="store_true")
     return parser.parse_args()
 
 
-def _resolve_post_ids(wp: WordPressClient, requested_ids: Iterable[int], limit: int, status: str) -> List[int]:
+def _resolve_post_ids(
+    wp: WordPressClient,
+    requested_ids: Iterable[int],
+    limit: int,
+    status: str,
+    fetch_all: bool = False,
+) -> List[int]:
     ids = [post_id for post_id in requested_ids if post_id > 0]
     if ids:
         return ids
-    posts = wp.list_posts(per_page=max(limit, 1), orderby="date", order="desc", status=status)
-    return [int(post.get("id")) for post in posts if isinstance(post.get("id"), int)]
+
+    per_page = 100 if fetch_all else min(max(limit, 1), 100)
+    page = 1
+    resolved_ids: list[int] = []
+
+    while True:
+        try:
+            posts = wp.list_posts(per_page=per_page, page=page, orderby="date", order="desc", status=status)
+        except ExternalServiceError as exc:
+            if fetch_all and page > 1 and "400 Client Error" in str(exc):
+                break
+            raise
+        page_ids = [int(post.get("id")) for post in posts if isinstance(post.get("id"), int)]
+        if not page_ids:
+            break
+        resolved_ids.extend(page_ids)
+        if not fetch_all and len(resolved_ids) >= max(limit, 1):
+            return resolved_ids[: max(limit, 1)]
+        if not fetch_all and len(page_ids) < per_page:
+            break
+        page += 1
+
+    return resolved_ids
 
 
 def _select_related_posts(
@@ -97,11 +126,29 @@ def _extract_place_names(content: str) -> list[str]:
     return names
 
 
+def _build_post_updates(post: Mapping[str, Any], settings: Settings, excerpt: str, refreshed_content: str, current_content: str) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    existing_excerpt = to_plain_text((post.get("excerpt") or {}).get("rendered", ""))
+    if refreshed_content and refreshed_content != current_content:
+        updates["content"] = refreshed_content
+    if excerpt and excerpt != existing_excerpt:
+        updates["excerpt"] = excerpt
+
+    if settings.wordpress_meta_description_key and excerpt:
+        raw_meta = post.get("meta")
+        existing_meta = raw_meta if isinstance(raw_meta, Mapping) else {}
+        existing_description = to_plain_text(existing_meta.get(settings.wordpress_meta_description_key))
+        if excerpt != existing_description:
+            updates["meta"] = {settings.wordpress_meta_description_key: excerpt}
+
+    return updates
+
+
 def main() -> None:
     args = _parse_args()
     settings = Settings()
     wp = WordPressClient()
-    post_ids = _resolve_post_ids(wp, args.post_ids, args.limit, args.status)
+    post_ids = _resolve_post_ids(wp, args.post_ids, args.limit, args.status, fetch_all=args.all)
 
     if not post_ids:
         print("No posts found.")
@@ -138,12 +185,13 @@ def main() -> None:
             summary=(post.get("excerpt") or {}).get("rendered", ""),
             intro=current,
         )
-        existing_excerpt = to_plain_text((post.get("excerpt") or {}).get("rendered", ""))
-        updates: dict[str, Any] = {}
-        if refreshed and refreshed != current:
-            updates["content"] = refreshed
-        if excerpt and excerpt != existing_excerpt:
-            updates["excerpt"] = excerpt
+        updates = _build_post_updates(
+            post=post,
+            settings=settings,
+            excerpt=excerpt,
+            refreshed_content=refreshed,
+            current_content=current,
+        )
 
         featured_media = post.get("featured_media")
         featured_alt = build_featured_media_alt_text(primary_keyword, _extract_place_names(refreshed or current))

@@ -132,3 +132,16 @@ def test_post_meta_helpers_strip_markdown_noise():
     assert "#" not in description
     assert "**" not in description
     assert featured_alt == "도쿄 라멘 맛집 이치란"
+
+
+def test_build_post_meta_description_prefixes_title_when_summary_misses_keyword():
+    payload = {
+        "title": "오사카 난바 맛집",
+        "summary": "난바에서 식사 장소를 빠르게 고를 수 있게 핵심만 정리했습니다.",
+        "intro": "오사카 난바 맛집 후보를 비교하는 여행자용 가이드입니다.",
+        "seo": {"primary_keyword": "오사카 난바 맛집"},
+    }
+
+    description = build_post_meta_description(payload)
+
+    assert "오사카 난바 맛집" in description

@@ -241,8 +241,10 @@ def _build_meta_fields(settings: Settings, payload: dict[str, Any], canonical_ur
     fields: dict[str, Any] = {}
     if settings.wordpress_meta_title_key and seo.get("title_tag"):
         fields[settings.wordpress_meta_title_key] = seo["title_tag"]
-    if settings.wordpress_meta_description_key and seo.get("meta_description"):
-        fields[settings.wordpress_meta_description_key] = seo["meta_description"]
+    if settings.wordpress_meta_description_key:
+        description = build_post_meta_description(payload)
+        if description:
+            fields[settings.wordpress_meta_description_key] = description
     if settings.wordpress_meta_keywords_key and seo.get("keywords"):
         fields[settings.wordpress_meta_keywords_key] = ", ".join(str(item) for item in seo["keywords"])
     if settings.wordpress_meta_canonical_key and canonical_url:

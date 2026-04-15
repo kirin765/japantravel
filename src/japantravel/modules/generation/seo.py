@@ -165,14 +165,16 @@ def build_meta_description(
     region: str = "",
     max_length: int = 155,
 ) -> str:
-    candidates = [
-        to_plain_text(summary),
-        to_plain_text(intro),
-        to_plain_text(title),
-    ]
-    for candidate in candidates:
-        if candidate:
-            return to_plain_text(candidate, max_length=max_length)
+    title_text = to_plain_text(title)
+    for candidate in (to_plain_text(summary), to_plain_text(intro)):
+        if not candidate:
+            continue
+        if title_text and title_text not in candidate:
+            return to_plain_text(f"{title_text} - {candidate}", max_length=max_length)
+        return to_plain_text(candidate, max_length=max_length)
+
+    if title_text:
+        return to_plain_text(title_text, max_length=max_length)
 
     fallback_region = to_plain_text(region)
     fallback = f"{fallback_region} 여행 정보를 정리한 가이드입니다." if fallback_region else "일본 여행 정보를 정리한 가이드입니다."

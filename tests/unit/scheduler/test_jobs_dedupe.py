@@ -3,7 +3,9 @@ from japantravel.modules.generation.topic_planner import select_topic_plan
 from japantravel.modules.ranking.scorer import RankItem, RankingComponents
 from japantravel.scheduler.jobs import (
     RecentPostSignature,
+    _build_wp_meta_fields,
     _build_public_taxonomy_terms,
+    _candidate_from_ranking,
     _extract_place_keys_from_wp_content,
     _filter_valid_image_urls,
     _infer_recent_post_region,
@@ -39,6 +41,37 @@ def test_extract_place_keys_from_wp_content_keeps_full_google_place_ids():
     keys = _extract_place_keys_from_wp_content(html)
 
     assert keys == {"ChIJlfWxscONGGARpqUGevsCnVo"}
+
+
+def test_candidate_from_ranking_uses_first_category_when_category_is_list():
+    rank_item = _rank_item(0.99, "a1", "Osaka")
+    rank_item.payload["place_type"] = []
+    rank_item.payload["category"] = ["museum", "art_gallery"]
+
+    candidate = _candidate_from_ranking(
+        rank_item,
+        scenario="solo_travel",
+        city="Osaka",
+        country="JP",
+    )
+
+    assert candidate.place_type == "museum"
+    assert candidate.topic_key == "jp-solo_travel-museum"
+
+
+def test_build_wp_meta_fields_uses_fallback_meta_description():
+    settings = Settings(wordpress_meta_description_key="seo_description")
+    payload = {
+        "title": "도쿄 라멘 맛집 정리",
+        "summary": "### 제목\n**도쿄 라멘 맛집**을 빠르게 찾는 방법입니다.",
+        "intro": "인트로입니다.",
+        "seo": {"primary_keyword": "도쿄 라멘 맛집"},
+    }
+
+    meta_fields = _build_wp_meta_fields(payload, settings)
+
+    assert "seo_description" in meta_fields
+    assert "도쿄 라멘 맛집" in meta_fields["seo_description"]
 
 
 def test_select_region_cluster_prefers_unused_region_over_recent_region():

@@ -1381,20 +1381,51 @@ def _candidate_from_ranking(
     duration_days: int = 0,
 ) -> ArticleCandidate:
     normalized_country = country.strip().lower() if isinstance(country, str) and country.strip() else "unknown"
+    normalized_place_type = _normalize_rank_item_place_type(rank_item.payload)
     duration_hint = f" {duration_days}일" if duration_days > 0 else ""
     angle_hint = f" {content_angle}" if content_angle else ""
     return ArticleCandidate(
-        topic_key=f"{normalized_country}-{scenario}-{rank_item.payload.get('place_type', 'general')}",
+        topic_key=f"{normalized_country}-{scenario}-{normalized_place_type}",
         city=city,
         country=country,
         scenario=scenario,
-        place_type=rank_item.payload.get("category", "general"),
+        place_type=normalized_place_type,
         audience=audience or "korean_traveler",
         query_text=f"{city or country} {scenario}{duration_hint}{angle_hint} 장소 추천".strip(),
         candidate_place_ids=[str(rank_item.place_id)] if rank_item.place_id else [],
         ranking_version="v1",
         status="draft",
     )
+
+
+def _normalize_rank_item_place_type(payload: Mapping[str, Any]) -> str:
+    for value in (payload.get("place_type"), payload.get("category")):
+        normalized = _normalize_place_type_value(value)
+        if normalized:
+            return normalized
+    return "general"
+
+
+def _normalize_place_type_value(value: Any) -> str:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or ""
+    if isinstance(value, Mapping):
+        for key in ("name", "slug", "type", "category"):
+            normalized = _normalize_place_type_value(value.get(key))
+            if normalized:
+                return normalized
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            normalized = _normalize_place_type_value(item)
+            if normalized:
+                return normalized
+        return ""
+    if value is None or isinstance(value, bool):
+        return ""
+    normalized = str(value).strip()
+    return normalized or ""
 
 
 def _topic_key(candidate: ArticleCandidate) -> str:
@@ -1570,7 +1601,7 @@ def _build_wp_meta_fields(payload: Mapping[str, Any], settings: Settings) -> dic
         if title_tag:
             meta_fields[settings.wordpress_meta_title_key] = title_tag
     if settings.wordpress_meta_description_key:
-        description = to_plain_text(seo.get("meta_description"))
+        description = build_post_meta_description(payload)
         if description:
             meta_fields[settings.wordpress_meta_description_key] = description
     if settings.wordpress_meta_keywords_key:
